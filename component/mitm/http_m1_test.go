@@ -31,7 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func makeTestAuthority(t *testing.T) (*CertificateAuthority, *x509.CertPool) {
+func makeTestAuthority(t testing.TB) (*CertificateAuthority, *x509.CertPool) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)

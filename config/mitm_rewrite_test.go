@@ -176,6 +176,15 @@ func TestMITMRetainsParsedRewriteInConnectionSnapshot(t *testing.T) {
 	if pinned.Rewrite == nil || pinned.RequestHook != nil || pinned.ResponseHook != nil {
 		t.Fatal("snapshot lost rewrite or unexpectedly wired HTTP hooks")
 	}
+	// Failed parsing must not publish a partial generation or poison the active
+	// immutable snapshot. The executor only receives successfully parsed Configs.
+	raw.MITM.Rewrite.Rules[0].Request.Method = "BAD METHOD"
+	if _, err := parseMITM(raw.MITM); err == nil {
+		t.Fatal("invalid reload unexpectedly parsed")
+	}
+	if manager.ConfigSnapshot().Rewrite != pinned.Rewrite {
+		t.Fatal("failed reload changed the active snapshot")
+	}
 	raw.MITM.Rewrite.Rules[0].Request.Method = "DELETE"
 	manager.Update(mitm.Config{})
 	target, _ := url.Parse("https://a.example/v1/items")

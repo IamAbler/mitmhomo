@@ -355,7 +355,9 @@ func validDomain(s string) bool {
 func validateTarget(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" || strings.Contains(raw, "#") || !validHeaderValue(raw) || strings.ContainsAny(raw, " \t\\") {
-		return nil, fmt.Errorf("invalid HTTPS rewrite URL %q", raw)
+		// Configuration errors may reach logs/API callers. URLs can contain
+		// credentials or query tokens; the caller already supplies the rule name.
+		return nil, fmt.Errorf("invalid HTTPS rewrite URL")
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	ip, ipErr := netip.ParseAddr(host)

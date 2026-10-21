@@ -127,7 +127,7 @@ func resolveCAFile(path string) (string, os.FileInfo, error) {
 }
 
 func (ca *CertificateAuthority) serverCertificate(serverName string) (tls.Certificate, error) {
-	if ca == nil || ca.signer == nil {
+	if ca == nil || ca.signer == nil || ca.leaf == nil {
 		return tls.Certificate{}, errors.New("MITM certificate authority is unavailable")
 	}
 	serverName = normalizeDomain(serverName)
@@ -137,6 +137,11 @@ func (ca *CertificateAuthority) serverCertificate(serverName string) (tls.Certif
 
 	ca.mu.Lock()
 	defer ca.mu.Unlock()
+	// Recheck at use time: a CA can expire after its snapshot was published.
+	now := time.Now()
+	if now.Before(ca.leaf.NotBefore) || !now.Before(ca.leaf.NotAfter) {
+		return tls.Certificate{}, errors.New("MITM CA certificate is not currently valid")
+	}
 	if element := ca.cache[serverName]; element != nil {
 		entry := element.Value.(*leafCertificate)
 		if entry.certificate.Leaf != nil && time.Until(entry.certificate.Leaf.NotAfter) > time.Minute {
@@ -166,11 +171,18 @@ func (ca *CertificateAuthority) issueServerCertificate(serverName string) (tls.C
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("generate MITM leaf key: %w", err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	// Select a positive serial in [1, 2^128-1].
+	limit := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 128), big.NewInt(1))
+	serial, err := rand.Int(rand.Reader, limit)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("generate MITM leaf serial: %w", err)
 	}
+	serial.Add(serial, big.NewInt(1))
 	now := time.Now()
+	notBefore := now.Add(-5 * time.Minute)
+	if notBefore.Before(ca.leaf.NotBefore) {
+		notBefore = ca.leaf.NotBefore
+	}
 	notAfter := now.Add(leafCertificateAge)
 	if notAfter.After(ca.leaf.NotAfter) {
 		notAfter = ca.leaf.NotAfter
@@ -179,7 +191,7 @@ func (ca *CertificateAuthority) issueServerCertificate(serverName string) (tls.C
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: serverName},
 		DNSNames:              []string{serverName},
-		NotBefore:             now.Add(-5 * time.Minute),
+		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},

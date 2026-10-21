@@ -855,12 +855,16 @@ func TestHandleTCPConnMITMUsesNativeRuleDialAndCleansTracker(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("native-route MITM connection did not release")
 	}
-	trackerExists := false
-	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
-		trackerExists = trackerExists || (tracker.Info().Metadata.Host == "example.com" && tracker.Info().Metadata.SrcPort == 45678)
+	// Transport may finish its asynchronous socket close after the downstream
+	// dispatcher returns. Assert bounded release, without assuming goroutine order.
+	require.Eventually(t, func() bool {
+		trackerExists := false
+		statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+			trackerExists = trackerExists || (tracker.Info().Metadata.Host == "example.com" && tracker.Info().Metadata.SrcPort == 45678)
+			return !trackerExists
+		})
 		return !trackerExists
-	})
-	require.False(t, trackerExists, "failed upstream TLS verification must close and unregister its native tracker")
+	}, time.Second, time.Millisecond, "completed upstream request must close and unregister its native tracker")
 }
 
 func TestMITMHTTPTransportTLSHandshakeTimeoutClosesNativeSocketAndTracker(t *testing.T) {

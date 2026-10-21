@@ -211,7 +211,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 					defer discardedBody.stop(w)
 					terminalWriter = &requestBodyDiscardResponseWriter{ResponseWriter: w, discard: discardedBody}
 				}
-				writeTerminalResponse(terminalWriter, request, result.Terminal, forceClose)
+				writeTerminalResponse(terminalWriter, r, result.Terminal, forceClose)
 				return
 			}
 			if err := applyRequestResult(request, result); err != nil {

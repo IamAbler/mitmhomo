@@ -45,9 +45,12 @@ func applyResponseRewrite(ctx context.Context, request rewrite.RequestView, resp
 	// rewritten outbound method. A HEAD upstream has no body to forward, but
 	// a non-HEAD client may still receive an explicit static replacement.
 	result.SuppressBody = downstreamMethod == http.MethodHead || responseForbidsBody(result.Response.StatusCode)
-	if request.Method == http.MethodHead && downstreamMethod != http.MethodHead && result.Body == nil && !result.SuppressBody {
-		// The upstream length describes a GET representation, not the empty stream.
+	if (request.Method == http.MethodHead || responseForbidsBody(response.StatusCode)) && result.Body == nil && !result.SuppressBody {
+		// HEAD/304 lengths describe a representation, not an available stream.
+		// A status rewrite must not turn that metadata into a promised body.
 		response.ContentLength = 0
+		result.Response.Headers = rewrite.HeaderMap(http.Header(result.Response.Headers).Clone())
+		clearReplacedRepresentationHeaders(http.Header(result.Response.Headers))
 		result.Response.Headers["Content-Length"] = []string{"0"}
 		forceAdapter = true
 	}
@@ -86,6 +89,12 @@ func applyResponseResult(response *http.Response, result rewrite.ResponseResult,
 	suppressBody := result.SuppressBody || requestMethod == http.MethodHead || bodylessStatus
 	if result.Body != nil && (status == http.StatusNoContent || status == http.StatusResetContent) {
 		return fmt.Errorf("response body replacement conflicts with status %d", status)
+	}
+	if result.Body != nil && status == http.StatusPartialContent {
+		// A full static representation has no valid upstream byte-range mapping.
+		// Require an explicit status rewrite (typically 200), rather than emit a
+		// 206 whose Content-Range was invalidated by the replacement.
+		return errors.New("response body replacement requires a non-206 status")
 	}
 
 	if result.Body != nil {
@@ -282,7 +291,9 @@ func normalizeResponseFraming(response *http.Response, header http.Header, statu
 			return err
 		}
 		if present {
-			if response.ContentLength >= 0 && response.ContentLength != length {
+			// Transport reports an empty 304 stream (ContentLength=0), while a
+			// legal Content-Length header describes the selected representation.
+			if status != http.StatusNotModified && response.ContentLength >= 0 && response.ContentLength != length {
 				return fmt.Errorf("response Content-Length header %d conflicts with body length %d", length, response.ContentLength)
 			}
 			response.ContentLength = length
