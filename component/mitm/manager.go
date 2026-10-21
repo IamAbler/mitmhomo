@@ -43,8 +43,8 @@ type Config struct {
 	IdleTimeout        time.Duration
 	RequestHook        RequestHook
 	ResponseHook       ResponseHook
-	// Rewrite is compiled but not invoked by the M1 HTTP handler. Keeping it
-	// in this snapshot prepares connection-scoped integration in M2 phase 2.
+	// Rewrite is immutable after publication and fixed for each intercepted TLS
+	// connection. The HTTP adapter applies its request and response stages.
 	Rewrite *rewrite.Snapshot
 	// upstreamRootCAs is an internal test seam. Production leaves it nil so
 	// the standard platform roots are used and certificate verification stays on.

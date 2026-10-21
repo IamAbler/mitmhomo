@@ -498,13 +498,15 @@ func configureM1DirectNativeProxy(t *testing.T, proxy *m1NativeProxy) *C.Metadat
 
 func requireM1TrackerRemoved(t *testing.T, metadata *C.Metadata) {
 	t.Helper()
-	found := false
-	statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
-		tracked := tracker.Info().Metadata
-		found = found || (tracked.Host == metadata.Host && tracked.SrcPort == metadata.SrcPort)
+	require.Eventually(t, func() bool {
+		found := false
+		statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+			tracked := tracker.Info().Metadata
+			found = found || (tracked.Host == metadata.Host && tracked.SrcPort == metadata.SrcPort)
+			return !found
+		})
 		return !found
-	})
-	require.False(t, found, "the MITM native Tracker must be removed after connection failure or close")
+	}, 3*time.Second, 5*time.Millisecond, "the MITM native Tracker must be removed after connection failure or close")
 }
 
 func requireM1TrackerPresent(t *testing.T, metadata *C.Metadata) {

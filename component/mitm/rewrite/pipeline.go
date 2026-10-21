@@ -15,6 +15,13 @@ func (s *Snapshot) HasRequestRules() bool {
 	return s != nil && s.hasRequestRules
 }
 
+// HasResponseRules reports whether this snapshot contains response-phase actions.
+// It lets HTTP adapters preserve the original streaming path when no response
+// rules are configured.
+func (s *Snapshot) HasResponseRules() bool {
+	return s != nil && s.hasResponseRules
+}
+
 // ApplyRequest matches each rule against the progressively rewritten request.
 // It never mutates the input; unchanged Headers remain borrowed from the caller.
 func (s *Snapshot) ApplyRequest(ctx context.Context, request RequestView) (RequestResult, error) {
@@ -91,7 +98,11 @@ func (s *Snapshot) ApplyResponse(ctx context.Context, request RequestView, respo
 		if a.Status != 0 {
 			result.Response.StatusCode = a.Status
 		}
+		headerTouchesContentType := rule.responseHeaders.touches("Content-Type")
 		if !rule.responseHeaders.empty() {
+			if headerTouchesContentType {
+				result.ContentTypeModified = true
+			}
 			if !headersOwned {
 				result.Response.Headers = cloneHeaders(result.Response.Headers)
 				headersOwned = true
@@ -101,18 +112,29 @@ func (s *Snapshot) ApplyResponse(ctx context.Context, request RequestView, respo
 		if a.Body != nil {
 			body := *a.Body
 			result.Body = &body
+			if body.ContentType != "" || !headerTouchesContentType {
+				if !headersOwned {
+					result.Response.Headers = cloneHeaders(result.Response.Headers)
+					headersOwned = true
+				}
+				deleteHeader(result.Response.Headers, "Content-Type")
+				if body.ContentType != "" {
+					result.Response.Headers["Content-Type"] = []string{body.ContentType}
+				}
+			}
+			result.ContentTypeModified = body.ContentType == "" && headerTouchesContentType
 		}
 	}
 	return finalizeResponse(request, result)
 }
 
 // finalizeResponse validates the complete composition, never an intermediate status.
-// Errors return no consumable partial result. HEAD replacement is deliberately
-// unsupported until representation metadata can be derived by an adapter.
+// Errors return no consumable partial result. Adapters may use a HEAD/304 body
+// replacement to derive representation metadata while suppressing its bytes.
 func finalizeResponse(request RequestView, result ResponseResult) (ResponseResult, error) {
 	status := result.Response.StatusCode
-	if result.Body != nil && (bodyless(status) || request.Method == "HEAD") {
-		return ResponseResult{}, fmt.Errorf("body replacement conflicts with final status %d or request method %s", status, request.Method)
+	if result.Body != nil && (status == 204 || status == 205) {
+		return ResponseResult{}, fmt.Errorf("body replacement conflicts with final status %d", status)
 	}
 	result.SuppressBody = bodyless(status) || request.Method == "HEAD"
 	// Content-Type and validators can describe the selected representation even
@@ -211,6 +233,19 @@ func cloneHeaders(headers HeaderMap) HeaderMap {
 	return result
 }
 func (ops headerOps) empty() bool { return len(ops.set) == 0 && len(ops.remove) == 0 }
+func (ops headerOps) touches(name string) bool {
+	for _, p := range ops.set {
+		if strings.EqualFold(p.name, name) {
+			return true
+		}
+	}
+	for _, n := range ops.remove {
+		if strings.EqualFold(n, name) {
+			return true
+		}
+	}
+	return false
+}
 func (ops headerOps) apply(headers HeaderMap) {
 	for _, name := range ops.remove {
 		deleteHeader(headers, name)

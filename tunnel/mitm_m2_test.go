@@ -301,3 +301,159 @@ func TestM2TerminalRequestSkipsTunnelNativeOutbound(t *testing.T) {
 		t.Fatal("terminal request left the client TLS connection active")
 	}
 }
+
+func TestM23ResponseRewriteUsesDIRECTAndPROXYNativeOutbound(t *testing.T) {
+	oldStatus, oldDispatcher, oldSniffing := Status(), snifferDispatcher, sniffingEnable
+	oldManager, oldMode := mitmDispatcher.Load(), mode
+	oldProxies, oldRules, oldSubRules, oldHosts := proxies, rules, subRules, resolver.DefaultHosts
+	t.Cleanup(func() {
+		status.Store(oldStatus)
+		snifferDispatcher, sniffingEnable = oldDispatcher, oldSniffing
+		mode, proxies, rules, subRules = oldMode, oldProxies, oldRules, oldSubRules
+		resolver.DefaultHosts = oldHosts
+		UpdateMITMManager(oldManager)
+		mihomoCA.ResetCertificate()
+	})
+	status.Store(Running)
+	snifferDispatcher, sniffingEnable = nil, false
+	resolver.DefaultHosts = resolver.NewHosts(trie.New[resolver.HostValue]())
+
+	observed := make(chan m2NativeRequest, 2)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body", http.StatusBadRequest)
+			return
+		}
+		observed <- m2NativeRequest{method: r.Method, path: r.URL.RequestURI(), host: r.Host, sni: r.TLS.ServerName, header: r.Header.Clone(), body: string(body)}
+		w.Header().Set("X-Upstream", "ready")
+		_, _ = io.WriteString(w, "original-response")
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamLeaf := upstream.TLS.Certificates[0].Leaf
+	if upstreamLeaf == nil {
+		var err error
+		upstreamLeaf, err = x509.ParseCertificate(upstream.TLS.Certificates[0].Certificate[0])
+		require.NoError(t, err)
+	}
+	mihomoCA.ResetCertificate()
+	require.NoError(t, mihomoCA.AddCertificate(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstreamLeaf.Raw}))))
+	_, err := upstreamLeaf.Verify(x509.VerifyOptions{Roots: mihomoCA.GetCertPool(), DNSName: "example.com"})
+	require.NoError(t, err, "the rewritten upstream target must have a verified TLS identity")
+	upstreamAddress := upstream.Listener.Addr().String()
+
+	pipeline, err := rewrite.Compile(rewrite.Config{Enable: true, Rules: []rewrite.Rule{
+		{
+			Name:  "request-cross-domain",
+			Match: rewrite.Match{Path: "/old", Methods: []string{http.MethodGet}},
+			Request: &rewrite.RequestAction{
+				URL:     "https://example.com/new?m2=m3",
+				Method:  http.MethodPatch,
+				Headers: rewrite.HeaderAction{Set: map[string]string{"X-Request-Rewrite": "active"}},
+			},
+		},
+		{
+			Name:  "response-final-target",
+			Match: rewrite.Match{Domains: []string{"example.com"}, Path: "/new", Methods: []string{http.MethodPatch}, Headers: map[string]string{"X-Upstream": "ready"}},
+			Response: &rewrite.ResponseAction{
+				Status:  http.StatusAccepted,
+				Headers: rewrite.HeaderAction{Set: map[string]string{"X-Response-Rewrite": "active"}},
+				Body:    &rewrite.BodyReplacement{Replace: "rewritten-native-response", ContentType: "text/plain"},
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	for index, outboundMode := range []TunnelMode{Direct, Rule} {
+		srcPort := uint16(48050 + index)
+		direct := &m1NativeProxy{name: "DIRECT", onDialMetadata: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstreamAddress)
+			if err != nil {
+				return nil, err
+			}
+			return &m1PlainNativeConn{ExtendedConn: N.NewExtendedConn(conn)}, nil
+		}}
+		selectedProxy := &m1NativeProxy{name: "M23_PROXY", onDialMetadata: func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
+			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstreamAddress)
+			if err != nil {
+				return nil, err
+			}
+			return &m1PlainNativeConn{ExtendedConn: N.NewExtendedConn(conn)}, nil
+		}}
+		mode = outboundMode
+		proxies = map[string]C.Proxy{"DIRECT": direct, "M23_PROXY": selectedProxy}
+		if outboundMode == Rule {
+			rules = []C.Rule{m1RouteRule{host: "example.com", adapter: "M23_PROXY"}}
+		} else {
+			rules = nil
+		}
+		subRules = nil
+		ca, roots := loadTunnelTestCA(t)
+		UpdateMITMManager(mitm.NewManager(mitm.Config{
+			Enabled: true, Ports: []uint16{443}, Domains: []string{"origin.example"}, CA: ca,
+			HandshakeTimeout: 3 * time.Second, ReadHeaderTimeout: 3 * time.Second,
+			RequestTimeout: 5 * time.Second, IdleTimeout: 3 * time.Second, Rewrite: pipeline,
+		}))
+
+		metadata := &C.Metadata{
+			NetWork: C.TCP, Type: C.TUNNEL, Host: "origin.example", DstPort: 443,
+			SrcIP: netip.MustParseAddr("192.0.2.30"), SrcPort: srcPort,
+		}
+		serverRaw, clientRaw := net.Pipe()
+		dispatchDone := make(chan struct{})
+		go func() {
+			handleTCPConn(icontext.NewConnContext(N.NewBufferedConn(serverRaw), metadata))
+			close(dispatchDone)
+		}()
+		client := tls.Client(clientRaw, &tls.Config{RootCAs: roots, ServerName: "origin.example", NextProtos: []string{"http/1.1"}})
+		_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+		require.NoError(t, client.Handshake())
+		_, err = io.WriteString(client, "GET /old HTTP/1.1\r\nHost: origin.example\r\n\r\n")
+		require.NoError(t, err)
+		response, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: http.MethodGet})
+		require.NoError(t, err)
+		require.Equal(t, http.StatusAccepted, response.StatusCode)
+		require.Equal(t, "active", response.Header.Get("X-Response-Rewrite"))
+		body, err := io.ReadAll(response.Body)
+		require.NoError(t, err)
+		require.NoError(t, response.Body.Close())
+		require.Equal(t, "rewritten-native-response", string(body))
+
+		select {
+		case request := <-observed:
+			require.Equal(t, http.MethodPatch, request.method)
+			require.Equal(t, "/new?m2=m3", request.path)
+			require.Equal(t, "example.com:443", request.host)
+			require.Equal(t, "example.com", request.sni)
+			require.Equal(t, "active", request.header.Get("X-Request-Rewrite"))
+		case <-time.After(3 * time.Second):
+			t.Fatal("rewritten request did not reach the verified native outbound")
+		}
+		directCalls, directMetadata := direct.snapshot()
+		proxyCalls, proxyMetadata := selectedProxy.snapshot()
+		if outboundMode == Direct {
+			require.Equal(t, 1, directCalls)
+			require.Zero(t, proxyCalls)
+			require.Equal(t, "example.com", directMetadata.Host)
+		} else {
+			require.Zero(t, directCalls)
+			require.Equal(t, 1, proxyCalls)
+			require.Equal(t, "example.com", proxyMetadata.Host)
+		}
+		_ = client.Close()
+		select {
+		case <-dispatchDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("M2.3 native outbound connection did not close")
+		}
+		require.Eventually(t, func() bool {
+			found := false
+			statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+				info := tracker.Info().Metadata
+				found = found || info.Host == "example.com" && info.SrcPort == srcPort
+				return !found
+			})
+			return !found
+		}, 3*time.Second, 10*time.Millisecond)
+	}
+}

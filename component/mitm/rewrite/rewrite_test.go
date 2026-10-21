@@ -226,6 +226,16 @@ func TestInvalidRules(t *testing.T) {
 			}
 		})
 	}
+	for _, name := range []string{"Content-Length", "Transfer-Encoding", "Trailer", "Connection", "Upgrade"} {
+		t.Run("response managed header "+name, func(t *testing.T) {
+			_, err := Compile(Config{Enable: true, Rules: []Rule{{
+				Name: "response", Response: &ResponseAction{Headers: HeaderAction{Set: map[string]string{name: "unsafe"}}},
+			}}})
+			if err == nil {
+				t.Fatalf("response rewrite accepted managed header %q", name)
+			}
+		})
+	}
 	for _, raw := range []string{"http://a.example/", "/relative", "https://user:pass@a.example/", "https://a.example:0/", "https://a.example:65536/", "https://a.example:/", "https://a.example/#fragment", "https://a.example/#", "https://[example.com]/", "https://::1/", "https://bad_host/", "https://a.example/?bad=%zz", "https://a.example/\r\n"} {
 		t.Run(raw, func(t *testing.T) {
 			r := basicRule()
@@ -400,6 +410,29 @@ func TestDisabledRulesAndAggregateLimits(t *testing.T) {
 	tooLarge := Rule{Name: "large", LocalResponse: &LocalResponse{Status: 200, Body: strings.Repeat("x", DefaultMaxReplacementBodyBytes+1)}}
 	if _, err := Compile(Config{Enable: true, Rules: []Rule{tooLarge}}); err == nil {
 		t.Fatal("default local payload limit ignored")
+	}
+}
+
+func TestHasResponseRules(t *testing.T) {
+	if (*Snapshot)(nil).HasResponseRules() {
+		t.Fatal("nil snapshot reported response rules")
+	}
+	empty := &Snapshot{}
+	if empty.HasResponseRules() {
+		t.Fatal("empty snapshot reported response rules")
+	}
+	requestOnly := compile(t, Rule{Name: "request", Request: &RequestAction{Method: "POST"}})
+	if requestOnly.HasResponseRules() {
+		t.Fatal("request-only snapshot reported response rules")
+	}
+	responseOnly := compile(t, Rule{Name: "response", Response: &ResponseAction{Status: 201}})
+	if !responseOnly.HasResponseRules() {
+		t.Fatal("response snapshot did not report response rules")
+	}
+	disabled := false
+	disabledResponse := compile(t, Rule{Name: "disabled", Enabled: &disabled, Response: &ResponseAction{Status: 201}})
+	if disabledResponse.HasResponseRules() {
+		t.Fatal("disabled response rule was counted")
 	}
 }
 

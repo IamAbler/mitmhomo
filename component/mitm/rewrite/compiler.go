@@ -36,8 +36,9 @@ type compiledRule struct {
 // Snapshot owns private compiled rules. It has no mutation API and is safe for
 // concurrent use. Compile preserves configuration order, with no priority sort.
 type Snapshot struct {
-	rules           []compiledRule
-	hasRequestRules bool
+	rules            []compiledRule
+	hasRequestRules  bool
+	hasResponseRules bool
 }
 
 // Compile validates even disabled rules, but a disabled configuration does not
@@ -76,6 +77,9 @@ func Compile(config Config) (*Snapshot, error) {
 			s.rules = append(s.rules, compiled)
 			if compiled.request != nil || compiled.terminal != nil {
 				s.hasRequestRules = true
+			}
+			if compiled.response != nil {
+				s.hasResponseRules = true
 			}
 		}
 	}
@@ -143,7 +147,7 @@ func compileRule(r Rule, limit int) (compiledRule, int, error) {
 		if a.Status != 0 && !validStatus(a.Status) {
 			return c, 0, fmt.Errorf("invalid response status %d", a.Status)
 		}
-		if a.Body != nil && bodyless(a.Status) {
+		if a.Body != nil && (a.Status == 204 || a.Status == 205) {
 			return c, 0, fmt.Errorf("body conflicts with status %d", a.Status)
 		}
 		c.responseHeaders, err = compileHeaders(r.Response.Headers)

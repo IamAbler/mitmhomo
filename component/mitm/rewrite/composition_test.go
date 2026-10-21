@@ -79,14 +79,14 @@ func TestResponseComposition(t *testing.T) {
 					request := view("https://a.example/")
 					request.Method = method
 					r, err := s.ApplyResponse(context.Background(), request, ResponseView{StatusCode: 200})
-					conflict := bodyless(status) || method == "HEAD"
+					conflict := status == 204 || status == 205
 					if conflict {
 						if err == nil || !reflect.DeepEqual(r, ResponseResult{}) {
 							t.Fatalf("expected atomic error: %+v %v", r, err)
 						}
 						return
 					}
-					if err != nil || r.Body == nil || r.Body.Replace != "payload" || r.Response.StatusCode != status || r.SuppressBody {
+					if err != nil || r.Body == nil || r.Body.Replace != "payload" || r.Response.StatusCode != status || r.SuppressBody != (bodyless(status) || method == "HEAD") {
 						t.Fatalf("result: %+v %v", r, err)
 					}
 				})
@@ -166,7 +166,7 @@ func TestConcurrentResponseComposition(t *testing.T) {
 }
 
 func TestCompileResponseBodyBoundaries(t *testing.T) {
-	for _, status := range []int{100, 101, 103, 204, 205, 304} {
+	for _, status := range []int{100, 101, 103, 204, 205} {
 		for _, payload := range []string{"", "content"} {
 			t.Run(fmt.Sprintf("%d/%s", status, payload), func(t *testing.T) {
 				_, err := Compile(Config{Enable: true, Rules: []Rule{{Name: "conflict", Response: &ResponseAction{Status: status, Body: &BodyReplacement{Replace: payload}}}}})
@@ -181,5 +181,14 @@ func TestCompileResponseBodyBoundaries(t *testing.T) {
 				t.Fatal("informational target accepted")
 			}
 		}
+	}
+	s, err := Compile(Config{Enable: true, Rules: []Rule{{Name: "not-modified", Response: &ResponseAction{Status: 304, Body: &BodyReplacement{Replace: "representation"}}}}})
+	if err != nil {
+		t.Fatalf("304 representation replacement rejected: %v", err)
+	}
+	request := view("https://a.example/")
+	result, err := s.ApplyResponse(context.Background(), request, ResponseView{StatusCode: 200})
+	if err != nil || result.Response.StatusCode != 304 || !result.SuppressBody || result.Body == nil || result.Body.Replace != "representation" {
+		t.Fatalf("304 replacement metadata: %+v %v", result, err)
 	}
 }

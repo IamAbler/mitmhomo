@@ -253,9 +253,15 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 			Rewrite: func(*httputil.ProxyRequest) {},
 			ModifyResponse: func(response *http.Response) error {
 				if snapshot.config.ResponseHook != nil {
-					return snapshot.config.ResponseHook(response)
+					if err := snapshot.config.ResponseHook(response); err != nil {
+						return err
+					}
 				}
-				return nil
+				return applyResponseRewrite(request.Context(), rewrite.RequestView{
+					Method:  request.Method,
+					URL:     *request.URL,
+					Headers: requestHeaders(request.Header, request.Host),
+				}, response, snapshot.config.Rewrite, snapshot.config.ResponseHook != nil, r.Method)
 			},
 			ErrorHandler: func(w http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
 				requestErr := proxyRequest.Context().Err()
@@ -951,9 +957,11 @@ func (roundTripper *nativeRoundTripper) RoundTrip(request *http.Request) (*http.
 	target := roundTripper.target.Clone()
 	tlsConfig := roundTripper.tlsConfig
 	transport := &http.Transport{
-		Proxy:                 nil,
-		TLSClientConfig:       tlsConfig,
-		DisableKeepAlives:     true,
+		Proxy:           nil,
+		TLSClientConfig: tlsConfig,
+		// Each request owns this transport. CloseIdleConnections below prevents
+		// pooling without forcing Connection: close onto upstream responses.
+		DisableKeepAlives:     false,
 		ForceAttemptHTTP2:     false,
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
 		TLSHandshakeTimeout:   roundTripper.handshakeTimeout,
@@ -986,7 +994,29 @@ func (roundTripper *nativeRoundTripper) RoundTrip(request *http.Request) (*http.
 		},
 	}
 	defer transport.CloseIdleConnections()
-	return transport.RoundTrip(request)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		return response, err
+	}
+	// ReverseProxy removes Connection before ModifyResponse. Capture its trailer
+	// nominations here, while they are still available, including late EOF values.
+	nominated := responseConnectionFields(response.Header)
+	if len(response.Trailer) > 0 && (len(nominated) > 0 || response.Close) {
+		// net/http removes the entire Connection header when it contains close,
+		// including any trailer nominations. Such trailers cannot be verified;
+		// omit them while continuing to stream the response body.
+		dropAll := response.Close
+		if dropAll {
+			for name := range response.Trailer {
+				delete(response.Trailer, name)
+			}
+		}
+		for _, name := range nominated {
+			response.Trailer.Del(name)
+		}
+		response.Body = &responseTrailerFilterBody{body: response.Body, trailers: response.Trailer, names: nominated, dropAll: dropAll}
+	}
+	return response, nil
 }
 
 func (listener *singleConnListener) Addr() net.Addr {

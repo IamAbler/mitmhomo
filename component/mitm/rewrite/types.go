@@ -121,13 +121,16 @@ type RequestResult struct {
 
 // SuppressBody forbids sending both the upstream body and replacement content.
 // Adapters must enforce it independently of Changed, and manage protocol framing
-// (including Transfer-Encoding/trailers). Preserved HEAD/304 Content-Length is
-// representation metadata, valid only for the corresponding GET representation.
+// (including Transfer-Encoding/trailers). For HEAD/304, a replacement may be
+// used to set representation metadata such as Content-Length without sending it.
 type ResponseResult struct {
 	SuppressBody bool
 	Response     ResponseView
 	Changed      bool
-	Body         *BodyReplacement
+	// ContentTypeModified means the final matching Header action changed or
+	// removed Content-Type after the latest Body action.
+	ContentTypeModified bool
+	Body                *BodyReplacement
 }
 
 // Separate interfaces let future HTTP/2 adapters and script hooks participate
