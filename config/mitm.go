@@ -13,16 +13,17 @@ import (
 
 // RawMITM configures the optional HTTP/1.1 HTTPS interception engine.
 type RawMITM struct {
-	Enable             bool     `yaml:"enable" json:"enable"`
-	Domains            []string `yaml:"domains" json:"domains"`
-	Ports              []string `yaml:"ports" json:"ports"`
-	CACertificate      string   `yaml:"ca-cert" json:"ca-cert"`
-	CAPrivateKey       string   `yaml:"ca-key" json:"ca-key"`
-	ClientHelloTimeout int      `yaml:"client-hello-timeout" json:"client-hello-timeout"`
-	HandshakeTimeout   int      `yaml:"handshake-timeout" json:"handshake-timeout"`
-	ReadHeaderTimeout  int      `yaml:"read-header-timeout" json:"read-header-timeout"`
-	RequestTimeout     int      `yaml:"request-timeout" json:"request-timeout"`
-	IdleTimeout        int      `yaml:"idle-timeout" json:"idle-timeout"`
+	Enable             bool       `yaml:"enable" json:"enable"`
+	Domains            []string   `yaml:"domains" json:"domains"`
+	Ports              []string   `yaml:"ports" json:"ports"`
+	CACertificate      string     `yaml:"ca-cert" json:"ca-cert"`
+	CAPrivateKey       string     `yaml:"ca-key" json:"ca-key"`
+	ClientHelloTimeout int        `yaml:"client-hello-timeout" json:"client-hello-timeout"`
+	HandshakeTimeout   int        `yaml:"handshake-timeout" json:"handshake-timeout"`
+	ReadHeaderTimeout  int        `yaml:"read-header-timeout" json:"read-header-timeout"`
+	RequestTimeout     int        `yaml:"request-timeout" json:"request-timeout"`
+	IdleTimeout        int        `yaml:"idle-timeout" json:"idle-timeout"`
+	Rewrite            RawRewrite `yaml:"rewrite" json:"rewrite"`
 }
 
 func parseMITM(raw RawMITM) (*mitm.Config, error) {
@@ -100,12 +101,17 @@ func parseMITM(raw RawMITM) (*mitm.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	rewriteSnapshot, err := parseMITMRewrite(raw.Rewrite)
+	if err != nil {
+		return nil, fmt.Errorf("mitm.rewrite: %w", err)
+	}
 	certificate, err := mitm.LoadCertificateAuthority(raw.CACertificate, raw.CAPrivateKey)
 	if err != nil {
 		return nil, err
 	}
 	return &mitm.Config{
 		Enabled:            true,
+		Rewrite:            rewriteSnapshot,
 		PortRanges:         ports,
 		Domains:            domains,
 		CA:                 certificate,

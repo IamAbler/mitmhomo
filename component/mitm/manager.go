@@ -11,6 +11,7 @@ import (
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
 	domainname "github.com/metacubex/sing/common/metadata"
@@ -42,6 +43,9 @@ type Config struct {
 	IdleTimeout        time.Duration
 	RequestHook        RequestHook
 	ResponseHook       ResponseHook
+	// Rewrite is compiled but not invoked by the M1 HTTP handler. Keeping it
+	// in this snapshot prepares connection-scoped integration in M2 phase 2.
+	Rewrite *rewrite.Snapshot
 	// upstreamRootCAs is an internal test seam. Production leaves it nil so
 	// the standard platform roots are used and certificate verification stays on.
 	upstreamRootCAs *x509.CertPool
@@ -85,6 +89,7 @@ func (m *Manager) Update(config Config) {
 			IdleTimeout:        config.IdleTimeout,
 			RequestHook:        config.RequestHook,
 			ResponseHook:       config.ResponseHook,
+			Rewrite:            config.Rewrite,
 			upstreamRootCAs:    config.upstreamRootCAs,
 		},
 		ports:      make(map[uint16]struct{}, len(config.Ports)),
@@ -133,6 +138,7 @@ func (m *Manager) ConfigSnapshot() Config {
 		IdleTimeout:        snapshot.config.IdleTimeout,
 		RequestHook:        snapshot.config.RequestHook,
 		ResponseHook:       snapshot.config.ResponseHook,
+		Rewrite:            snapshot.config.Rewrite,
 		upstreamRootCAs:    snapshot.config.upstreamRootCAs,
 	}
 }
