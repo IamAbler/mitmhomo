@@ -118,7 +118,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	}
 	tlsConn := tls.Server(conn, &tls.Config{
 		Certificates: []tls.Certificate{certificate},
-		NextProtos:   []string{"http/1.1"},
+		NextProtos:   []string{"h2", "http/1.1"},
 		MinVersion:   tls.VersionTLS12,
 	})
 	handshakeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
@@ -128,7 +128,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		_ = tlsConn.Close()
 		return fmt.Errorf("MITM client TLS handshake: %w", err)
 	}
-	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != "http/1.1" {
+	if protocol := tlsConn.ConnectionState().NegotiatedProtocol; protocol != "" && protocol != "http/1.1" && protocol != "h2" {
 		_ = tlsConn.Close()
 		return fmt.Errorf("unsupported negotiated protocol %q", protocol)
 	}
@@ -148,7 +148,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	if upstreamRoots == nil {
 		upstreamRoots = ca.GetCertPool()
 	}
-	upstreamTLSConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: upstreamRoots}
+	upstreamTLSConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: upstreamRoots, NextProtos: []string{"http/1.1"}}
 	originHost := normalizeDomain(metadata.Host)
 	if originHost == "" {
 		originHost = normalizeDomain(hello.ServerName)
@@ -159,8 +159,8 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor != 1 || r.ProtoMinor != 1 {
-			rejectRequest(w, r, http.StatusHTTPVersionNotSupported, "HTTP/1.1 is required")
+		if !(r.ProtoMajor == 1 && r.ProtoMinor == 1 || r.ProtoMajor == 2 && tlsConn.ConnectionState().NegotiatedProtocol == "h2") {
+			rejectRequest(w, r, http.StatusHTTPVersionNotSupported, "HTTP/1.1 or negotiated HTTP/2 is required")
 			return
 		}
 		if r.Method == http.MethodConnect || hasUpgrade(r) {
@@ -302,6 +302,10 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
+	}
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		serveHTTP2Connection(ctx, tlsConn, server)
+		return ctx.Err()
 	}
 	closed := make(chan struct{})
 	var closeOnce sync.Once
@@ -487,6 +491,11 @@ type requestBodyDiscard struct {
 
 func startRequestBodyDiscard(w http.ResponseWriter, request *http.Request, cancel context.CancelCauseFunc) (*requestBodyDiscard, bool) {
 	if request == nil || request.Body == nil || request.Body == http.NoBody || request.ContentLength == 0 {
+		return nil, false
+	}
+	if request.ProtoMajor == 2 {
+		// HTTP/2 owns the inbound body per stream and closes it after the
+		// handler returns. Never apply HTTP/1 connection discard/close policy.
 		return nil, false
 	}
 	const maxReusableDiscardBytes = 64 << 10

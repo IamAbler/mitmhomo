@@ -198,7 +198,7 @@ func sendHTTPOverTLS(t *testing.T, client *tls.Conn, method, path, body string) 
 }
 
 func TestM1DispatchHTTP11GetPostKeepAliveAndVerifiedUpstream(t *testing.T) {
-	client, dispatchDone, dialCount, _ := newMITMDispatchHarness(t, true, []string{"h2", "http/1.1"})
+	client, dispatchDone, dialCount, _ := newMITMDispatchHarness(t, true, []string{"http/1.1"})
 	reader := bufio.NewReader(client)
 	for _, test := range []struct {
 		method string
@@ -360,7 +360,7 @@ func TestM1DispatchRejectsAuthorityUpgradeAndUntrustedUpstream(t *testing.T) {
 	})
 
 	t.Run("untrusted upstream certificate returns 502", func(t *testing.T) {
-		client, dispatchDone, dialCount, _ := newMITMDispatchHarness(t, false, []string{"h2", "http/1.1"})
+		client, dispatchDone, dialCount, _ := newMITMDispatchHarness(t, false, []string{"http/1.1"})
 		response := sendHTTPOverTLS(t, client, http.MethodGet, "/", "")
 		_, err := io.Copy(io.Discard, response.Body)
 		require.NoError(t, err)
@@ -416,7 +416,7 @@ func TestM1DispatchRejectsMisdirectedRequestAndUnknownALPN(t *testing.T) {
 			outcome, err := manager.Dispatch(context.Background(), N.NewBufferedConn(serverRaw), &C.Metadata{NetWork: C.TCP, Type: C.TUNNEL, Host: "localhost", DstPort: 443}, nil, func(context.Context, *C.Metadata, NativeTLSHandshake) (net.Conn, error) { return nil, nil })
 			result <- dispatchResult{outcome: outcome, err: err}
 		}()
-		client := tls.Client(clientRaw, &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"h2"}})
+		client := tls.Client(clientRaw, &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"unsupported-protocol"}})
 		require.Error(t, client.Handshake(), "no common ALPN must be rejected during TLS negotiation")
 		_ = client.Close()
 		dispatch := <-result
