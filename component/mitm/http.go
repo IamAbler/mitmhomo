@@ -243,6 +243,12 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		}
 		proxy := &httputil.ReverseProxy{
 			Transport: &nativeRoundTripper{
+				inboundH2Trailers: func() http.Header {
+					if r.ProtoMajor == 2 {
+						return r.Trailer
+					}
+					return nil
+				}(),
 				target:           targetMetadata,
 				dial:             dial,
 				tlsConfig:        upstreamTLSConfig,
@@ -257,11 +263,18 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 						return err
 					}
 				}
-				return applyResponseRewrite(request.Context(), rewrite.RequestView{
+				err := applyResponseRewrite(request.Context(), rewrite.RequestView{
 					Method:  request.Method,
 					URL:     *request.URL,
 					Headers: requestHeaders(request.Header, request.Host),
 				}, response, snapshot.config.Rewrite, snapshot.config.ResponseHook != nil, r.Method)
+				if err == nil && r.ProtoMajor == 2 && response.StatusCode == http.StatusNotModified {
+					// A 304 has no DATA. Omit optional representation length for
+					// clients that interpret it as a promised stream length.
+					response.Header.Del("Content-Length")
+					response.ContentLength = -1
+				}
+				return err
 			},
 			ErrorHandler: func(w http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
 				requestErr := proxyRequest.Context().Err()
@@ -905,8 +918,10 @@ func hasUpgrade(request *http.Request) bool {
 }
 
 func rejectRequest(w http.ResponseWriter, request *http.Request, status int, message string) {
-	w.Header().Set("Connection", "close")
-	request.Close = true
+	if request.ProtoMajor != 2 {
+		w.Header().Set("Connection", "close")
+		request.Close = true
+	}
 	http.Error(w, message, status)
 }
 
@@ -950,17 +965,21 @@ func (listener *singleConnListener) Close() error {
 // capture the exact request context and target in this RoundTripper instead of
 // relying on Transport to preserve request Context values for DialTLSContext.
 type nativeRoundTripper struct {
-	target           *C.Metadata
-	dial             NativeDialContext
-	tlsConfig        *tls.Config
-	handshakeTimeout time.Duration
-	requestTimeout   time.Duration
-	idleTimeout      time.Duration
+	inboundH2Trailers http.Header
+	target            *C.Metadata
+	dial              NativeDialContext
+	tlsConfig         *tls.Config
+	handshakeTimeout  time.Duration
+	requestTimeout    time.Duration
+	idleTimeout       time.Duration
 }
 
 func (roundTripper *nativeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	if roundTripper.target == nil || roundTripper.dial == nil {
 		return nil, errors.New("native outbound target or dialer is unavailable")
+	}
+	if err := bridgeHTTP2RequestTrailers(request, roundTripper.inboundH2Trailers); err != nil {
+		return nil, err
 	}
 	requestCtx := request.Context()
 	target := roundTripper.target.Clone()

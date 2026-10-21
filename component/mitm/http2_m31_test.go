@@ -33,9 +33,17 @@ type h2Harness struct {
 // Both sides use real TCP + verified TLS. The client uses one explicit
 // ClientConn so a successful second request cannot hide a redial.
 func newH2Harness(t *testing.T, upstreamHandler http.Handler, failDial, trust bool, options ...func(*Config)) *h2Harness {
+	return newH2HarnessWithManager(t, nil, upstreamHandler, failDial, trust, options...)
+}
+
+func newH2HarnessWithManager(t *testing.T, manager *Manager, upstreamHandler http.Handler, failDial, trust bool, options ...func(*Config)) *h2Harness {
+	return newH2HarnessTarget(t, manager, "localhost", 443, upstreamHandler, failDial, trust, options...)
+}
+
+func newH2HarnessTarget(t *testing.T, manager *Manager, targetHost string, targetPort uint16, upstreamHandler http.Handler, failDial, trust bool, options ...func(*Config)) *h2Harness {
 	t.Helper()
 	h := &h2Harness{done: make(chan dispatchResult, 1)}
-	cert, roots := makeTestUpstreamCertificate(t)
+	cert, roots := makeTestUpstreamCertificateFor(t, targetHost)
 	upstream := httptest.NewUnstartedServer(upstreamHandler)
 	upstream.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}}
 	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -66,6 +74,10 @@ func newH2Harness(t *testing.T, upstreamHandler http.Handler, failDial, trust bo
 		option(&cfg)
 	}
 	h.manager = NewManager(cfg)
+	if manager != nil {
+		h.manager = manager
+		clientRoots.AddCert(manager.ConfigSnapshot().CA.leaf)
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
@@ -83,7 +95,7 @@ func newH2Harness(t *testing.T, upstreamHandler http.Handler, failDial, trust bo
 				if failDial {
 					return nil, errors.New("test native dial failure")
 				}
-				if metadata.Host != "localhost" || metadata.DstPort != 443 {
+				if metadata.Host != targetHost || metadata.DstPort != targetPort {
 					return nil, errors.New("wrong native target")
 				}
 				conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream.Listener.Addr().String())
