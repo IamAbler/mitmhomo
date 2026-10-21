@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,6 +18,7 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
 	domainname "github.com/metacubex/sing/common/metadata"
@@ -170,23 +172,75 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 			rejectRequest(w, r, http.StatusMisdirectedRequest, "request authority does not match the TLS origin")
 			return
 		}
-		request := r.Clone(r.Context())
+		timeoutCtx, stopTimeout := context.WithTimeout(r.Context(), requestTimeout)
+		requestCtx, cancel := context.WithCancelCause(timeoutCtx)
+		defer stopTimeout()
+		defer cancel(context.Canceled)
+		initialURL := *urlTarget
+		request := r.Clone(requestCtx)
 		request.URL = urlTarget
 		request.RequestURI = ""
+		var discardedBody *requestBodyDiscard
 		if snapshot.config.RequestHook != nil {
 			if err := snapshot.config.RequestHook(request); err != nil {
 				rejectRequest(w, r, http.StatusBadRequest, "request rejected")
 				return
 			}
 		}
+		if request.URL == nil {
+			rejectRequest(w, r, http.StatusBadRequest, "invalid rewritten request target")
+			return
+		}
+		if pipeline := snapshot.config.Rewrite; pipeline != nil && pipeline.HasRequestRules() {
+			result, err := pipeline.ApplyRequest(request.Context(), rewrite.RequestView{
+				Method:  request.Method,
+				URL:     *request.URL,
+				Headers: requestHeaders(request.Header, request.Host),
+			})
+			if err != nil {
+				if request.Context().Err() != nil {
+					return
+				}
+				rejectRequest(w, r, http.StatusInternalServerError, "request rewrite failed")
+				return
+			}
+			if result.Terminal != nil {
+				discardedBody, forceClose := startRequestBodyDiscard(w, r, cancel)
+				terminalWriter := w
+				if discardedBody != nil {
+					defer discardedBody.stop(w)
+					terminalWriter = &requestBodyDiscardResponseWriter{ResponseWriter: w, discard: discardedBody}
+				}
+				writeTerminalResponse(terminalWriter, request, result.Terminal, forceClose)
+				return
+			}
+			if err := applyRequestResult(request, result); err != nil {
+				rejectRequest(w, r, http.StatusBadRequest, "invalid rewritten request")
+				return
+			}
+			if result.Body != nil {
+				discardedBody, _ = startRequestBodyDiscard(w, r, cancel)
+				if discardedBody != nil {
+					defer discardedBody.stop(w)
+				}
+			}
+		}
+		urlAuthorityChanged := !strings.EqualFold(initialURL.Scheme, request.URL.Scheme) || !sameURLAuthority(initialURL.Host, request.URL.Host)
+		if err := normalizeRequestURL(request); err != nil {
+			rejectRequest(w, r, http.StatusBadRequest, "invalid rewritten request target")
+			return
+		}
+		if urlAuthorityChanged {
+			// The final HTTPS URL is authoritative for HTTP Host and upstream SNI.
+			// Host is not a configurable rewrite header because it is represented
+			// separately by net/http.Request.Host.
+			request.Host = request.URL.Host
+		}
 		targetMetadata, err := metadataForURL(metadata, request.URL, originHost)
 		if err != nil {
 			rejectRequest(w, r, http.StatusBadRequest, "invalid upstream target")
 			return
 		}
-		requestCtx, cancel := context.WithTimeout(request.Context(), requestTimeout)
-		defer cancel()
-		request = request.WithContext(requestCtx)
 		proxy := &httputil.ReverseProxy{
 			Transport: &nativeRoundTripper{
 				target:           targetMetadata,
@@ -203,26 +257,42 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 				}
 				return nil
 			},
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, roundTripErr error) {
-				if r.Context().Err() != nil {
+			ErrorHandler: func(w http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
+				requestErr := proxyRequest.Context().Err()
+				requestCause := context.Cause(proxyRequest.Context())
+				requestTimedOut := errors.Is(roundTripErr, context.DeadlineExceeded) || errors.Is(requestErr, context.DeadlineExceeded) || errors.Is(requestCause, context.DeadlineExceeded)
+				if errors.Is(requestErr, context.Canceled) && !requestTimedOut && discardedBody != nil {
+					// The HTTP server can cancel the request Context as soon as a
+					// timed-out Body.Read fails. Wait for that reader's result before
+					// classifying the cancellation, so a body read timeout is not
+					// mistaken for a disconnected client and turned into an empty 200.
+					requestTimedOut = isTimeoutError(discardedBody.resultAfterDone().err)
+				}
+				if errors.Is(requestErr, context.Canceled) && !requestTimedOut {
 					return
 				}
 				status := http.StatusBadGateway
-				if errors.Is(roundTripErr, context.DeadlineExceeded) {
+				if requestTimedOut {
 					status = http.StatusGatewayTimeout
 				}
 				http.Error(w, "upstream request failed", status)
 			},
 		}
-		proxy.ServeHTTP(w, request)
+		proxyWriter := w
+		if discardedBody != nil {
+			proxyWriter = &requestBodyDiscardResponseWriter{ResponseWriter: w, discard: discardedBody}
+		}
+		proxy.ServeHTTP(proxyWriter, request)
 	})
 	server := &http.Server{
 		Handler:           handler,
 		ReadTimeout:       requestTimeout,
 		ReadHeaderTimeout: headerTimeout,
-		WriteTimeout:      requestTimeout,
-		IdleTimeout:       idleTimeout,
-		MaxHeaderBytes:    1 << 20,
+		// Keep a short write window after the per-request Context expires so
+		// the ErrorHandler can return the resulting 504 to a connected client.
+		WriteTimeout:   requestTimeout + time.Second,
+		IdleTimeout:    idleTimeout,
+		MaxHeaderBytes: 1 << 20,
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
@@ -246,6 +316,445 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		_ = conn.Close()
 		return ctx.Err()
 	}
+}
+
+func requestHeaders(headers http.Header, host string) rewrite.HeaderMap {
+	result := make(rewrite.HeaderMap, len(headers)+1)
+	for name, values := range headers {
+		result[name] = values
+	}
+	if host != "" {
+		result["Host"] = []string{host}
+	}
+	return result
+}
+
+func applyRequestResult(request *http.Request, result rewrite.RequestResult) error {
+	if request == nil || result.Terminal != nil {
+		return errors.New("invalid non-terminal request rewrite result")
+	}
+	oldContentType := append([]string(nil), request.Header.Values("Content-Type")...)
+	request.Method = result.Request.Method
+	target := result.Request.URL
+	request.URL = &target
+	request.RequestURI = ""
+	request.Header = http.Header(result.Request.Headers)
+	request.Header.Del("Host")
+	if result.Body == nil {
+		return nil
+	}
+
+	// The request clone shares the server's inbound Body, but the HTTP server
+	// owns its disposal. Closing it here can synchronously wait for a partial
+	// upload; the handler coordinates a bounded discard before responding, and
+	// the server performs the single final Close after the handler returns.
+	body := result.Body.Replace
+	request.Body = replacementReader(body)
+	request.GetBody = func() (io.ReadCloser, error) { return replacementReader(body), nil }
+	request.ContentLength = int64(len(body))
+	request.TransferEncoding = nil
+	request.Trailer = nil
+	for _, name := range []string{
+		"Content-Length", "Transfer-Encoding", "Trailer", "Expect", "Content-Encoding",
+		"Content-MD5", "Digest", "Content-Range",
+	} {
+		request.Header.Del(name)
+	}
+	if result.Body.ContentType != "" {
+		request.Header.Set("Content-Type", result.Body.ContentType)
+	} else if equalHeaderValues(oldContentType, request.Header.Values("Content-Type")) {
+		// Keep a Content-Type deliberately changed by a later Header action, but
+		// discard the incoming type when it would describe the replaced body.
+		request.Header.Del("Content-Type")
+	}
+	return nil
+}
+
+func equalHeaderValues(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func replacementReader(body string) io.ReadCloser {
+	if body == "" {
+		return http.NoBody
+	}
+	return io.NopCloser(strings.NewReader(body))
+}
+
+func writeTerminalResponse(w http.ResponseWriter, request *http.Request, terminal *rewrite.TerminalResponse, forceClose bool) {
+	if terminal == nil {
+		return
+	}
+	if terminal.StatusCode < http.StatusOK || terminal.StatusCode > 599 || terminal.StatusCode == http.StatusSwitchingProtocols || terminal.Decision != rewrite.RedirectResponse && terminal.Decision != rewrite.LocalResponseDecision {
+		writeInvalidTerminalResponse(w, forceClose)
+		return
+	}
+	if terminal.Decision == rewrite.RedirectResponse {
+		switch terminal.StatusCode {
+		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		default:
+			writeInvalidTerminalResponse(w, forceClose)
+			return
+		}
+		if terminal.Body != "" {
+			writeInvalidTerminalResponse(w, forceClose)
+			return
+		}
+	}
+	if (terminal.StatusCode == http.StatusNoContent || terminal.StatusCode == http.StatusResetContent || terminal.StatusCode == http.StatusNotModified) && terminal.Body != "" {
+		writeInvalidTerminalResponse(w, forceClose)
+		return
+	}
+	connectionFields := connectionNominatedHeaders(terminal.Headers)
+	prepared := make(http.Header, len(terminal.Headers))
+	for name, values := range terminal.Headers {
+		if !validTerminalHeaderName(name) {
+			writeInvalidTerminalResponse(w, forceClose)
+			return
+		}
+		if terminalHeaderIsManaged(name) || terminalHeaderIsHopByHop(name) || connectionFields[strings.ToLower(name)] {
+			continue
+		}
+		for _, value := range values {
+			if !validTerminalHeaderValue(value) || strings.EqualFold(name, "Location") && terminal.Decision == rewrite.RedirectResponse && !validRedirectLocation(value) {
+				writeInvalidTerminalResponse(w, forceClose)
+				return
+			}
+			prepared.Add(name, value)
+		}
+	}
+	if terminal.Decision == rewrite.RedirectResponse {
+		locations := prepared.Values("Location")
+		if len(locations) != 1 || !validRedirectLocation(locations[0]) {
+			writeInvalidTerminalResponse(w, forceClose)
+			return
+		}
+	}
+	header := w.Header()
+	for name := range header {
+		header.Del(name)
+	}
+	for name, values := range prepared {
+		header[name] = append([]string(nil), values...)
+	}
+	bodylessStatus := terminal.StatusCode == http.StatusNoContent || terminal.StatusCode == http.StatusResetContent || terminal.StatusCode == http.StatusNotModified
+	if terminal.StatusCode == http.StatusResetContent {
+		header.Set("Content-Length", "0")
+	} else if terminal.StatusCode != http.StatusNoContent && terminal.StatusCode != http.StatusNotModified {
+		// The adapter owns the wire length. This also describes the selected
+		// representation for HEAD while the body itself remains suppressed.
+		header.Set("Content-Length", strconv.Itoa(len(terminal.Body)))
+		if terminal.Body != "" && header.Get("Content-Type") == "" {
+			header.Set("Content-Type", "text/plain; charset=utf-8")
+		}
+	}
+	if forceClose {
+		header.Set("Connection", "close")
+	}
+	w.WriteHeader(terminal.StatusCode)
+	if request != nil && request.Method != http.MethodHead && !bodylessStatus && terminal.Body != "" {
+		_, _ = io.WriteString(w, terminal.Body)
+	}
+}
+
+type requestBodyDiscardResult struct {
+	complete bool
+	err      error
+}
+
+type requestBodyDiscard struct {
+	done            chan struct{}
+	mu              sync.Mutex
+	result          requestBodyDiscardResult
+	reusable        bool
+	request         *http.Request
+	responseStarted bool
+}
+
+func startRequestBodyDiscard(w http.ResponseWriter, request *http.Request, cancel context.CancelCauseFunc) (*requestBodyDiscard, bool) {
+	if request == nil || request.Body == nil || request.Body == http.NoBody || request.ContentLength == 0 {
+		return nil, false
+	}
+	const maxReusableDiscardBytes = 64 << 10
+	if request.Header.Get("Expect") != "" {
+		// Do not trigger a 100-continue exchange solely to discard a body that
+		// the upstream does not need. Close this HTTP/1 connection after reply.
+		request.Close = true
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		return nil, true
+	}
+	reusable := request.ContentLength > 0 && request.ContentLength <= maxReusableDiscardBytes && request.Header.Get("Expect") == ""
+	if !reusable {
+		request.Close = true
+		w.Header().Set("Connection", "close")
+	}
+	limit := int64(maxReusableDiscardBytes + 1)
+	if reusable {
+		// Read one byte beyond the declared size so the server Body observes EOF
+		// and may safely reuse this HTTP/1 connection.
+		limit = request.ContentLength + 1
+	}
+	discard := &requestBodyDiscard{done: make(chan struct{}), reusable: reusable, request: request}
+	go func() {
+		_, err := io.CopyN(io.Discard, request.Body, limit)
+		result := requestBodyDiscardResult{complete: errors.Is(err, io.EOF), err: err}
+		discard.mu.Lock()
+		if err != nil && !errors.Is(err, io.EOF) && !discard.responseStarted {
+			// A failed bounded read before the response begins means the client
+			// disconnected or its upload timed out. Cancel active upstream work.
+			cause := error(context.Canceled)
+			if isTimeoutError(err) {
+				cause = context.DeadlineExceeded
+			}
+			cancel(cause)
+		}
+		discard.result = result
+		close(discard.done)
+		discard.mu.Unlock()
+	}()
+	return discard, !reusable
+}
+
+func (discard *requestBodyDiscard) wait(ctx context.Context) (requestBodyDiscardResult, error) {
+	select {
+	case <-discard.done:
+		discard.mu.Lock()
+		defer discard.mu.Unlock()
+		if discard.result.err != nil && !errors.Is(discard.result.err, io.EOF) {
+			return discard.result, discard.result.err
+		}
+		return discard.result, nil
+	case <-ctx.Done():
+		return requestBodyDiscardResult{}, ctx.Err()
+	}
+}
+
+func (discard *requestBodyDiscard) resultAfterDone() requestBodyDiscardResult {
+	<-discard.done
+	discard.mu.Lock()
+	defer discard.mu.Unlock()
+	return discard.result
+}
+
+func isTimeoutError(err error) bool {
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+func (discard *requestBodyDiscard) forceClose(w http.ResponseWriter) {
+	discard.request.Close = true
+	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+}
+
+func (discard *requestBodyDiscard) beforeResponseWrite(w http.ResponseWriter) {
+	discard.mu.Lock()
+	discard.responseStarted = true
+	select {
+	case <-discard.done:
+		if discard.reusable && discard.result.complete && (discard.result.err == nil || errors.Is(discard.result.err, io.EOF)) {
+			discard.mu.Unlock()
+			return
+		}
+	default:
+	}
+	discard.mu.Unlock()
+	discard.forceClose(w)
+	<-discard.done
+}
+
+func (discard *requestBodyDiscard) stop(w http.ResponseWriter) {
+	select {
+	case <-discard.done:
+		result, _ := discard.wait(context.Background())
+		if result.err != nil && !errors.Is(result.err, io.EOF) {
+			discard.mu.Lock()
+			discard.responseStarted = true
+			discard.mu.Unlock()
+			discard.request.Close = true
+			w.Header().Set("Connection", "close")
+		}
+	default:
+		discard.mu.Lock()
+		discard.responseStarted = true
+		discard.mu.Unlock()
+		discard.forceClose(w)
+		<-discard.done
+	}
+}
+
+type requestBodyDiscardResponseWriter struct {
+	http.ResponseWriter
+	discard *requestBodyDiscard
+}
+
+func (writer *requestBodyDiscardResponseWriter) Unwrap() http.ResponseWriter {
+	return writer.ResponseWriter
+}
+
+func (writer *requestBodyDiscardResponseWriter) WriteHeader(statusCode int) {
+	writer.discard.beforeResponseWrite(writer.ResponseWriter)
+	writer.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (writer *requestBodyDiscardResponseWriter) Write(body []byte) (int, error) {
+	writer.discard.beforeResponseWrite(writer.ResponseWriter)
+	return writer.ResponseWriter.Write(body)
+}
+
+func (writer *requestBodyDiscardResponseWriter) Flush() {
+	_ = writer.FlushError()
+}
+
+func (writer *requestBodyDiscardResponseWriter) FlushError() error {
+	writer.discard.beforeResponseWrite(writer.ResponseWriter)
+	return http.NewResponseController(writer.ResponseWriter).Flush()
+}
+
+func connectionNominatedHeaders(headers rewrite.HeaderMap) map[string]bool {
+	var result map[string]bool
+	for name, values := range headers {
+		if !strings.EqualFold(name, "Connection") {
+			continue
+		}
+		for _, value := range values {
+			for _, field := range strings.Split(value, ",") {
+				field = strings.TrimSpace(field)
+				if field == "" {
+					continue
+				}
+				if result == nil {
+					result = make(map[string]bool)
+				}
+				result[strings.ToLower(field)] = true
+			}
+		}
+	}
+	return result
+}
+
+func terminalHeaderIsManaged(name string) bool {
+	switch strings.ToLower(name) {
+	case "host", "content-length", "transfer-encoding", "trailer":
+		return true
+	default:
+		return false
+	}
+}
+
+func terminalHeaderIsHopByHop(name string) bool {
+	switch strings.ToLower(name) {
+	case "connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "proxy-authentication-info", "te", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func validTerminalHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))) {
+			return false
+		}
+	}
+	return true
+}
+
+func validTerminalHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		if value[i] == 127 || value[i] < 32 && value[i] != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+func validRedirectLocation(raw string) bool {
+	if raw == "" || !validTerminalHeaderValue(raw) || strings.ContainsAny(raw, " \t\\") {
+		return false
+	}
+	target, err := url.Parse(raw)
+	if err != nil || target.User != nil || target.Opaque != "" {
+		return false
+	}
+	if _, err := url.QueryUnescape(target.RawQuery); err != nil {
+		return false
+	}
+	if target.IsAbs() {
+		if !strings.EqualFold(target.Scheme, "https") || target.Host == "" {
+			return false
+		}
+		_, _, err := parseAuthority(target.Host, 443)
+		return err == nil
+	}
+	return target.Host == "" && !strings.HasPrefix(raw, "//")
+}
+
+func writeInvalidTerminalResponse(w http.ResponseWriter, forceClose bool) {
+	header := w.Header()
+	for name := range header {
+		header.Del(name)
+	}
+	if forceClose {
+		header.Set("Connection", "close")
+	}
+	http.Error(w, "invalid terminal response", http.StatusInternalServerError)
+}
+
+func normalizeRequestURL(request *http.Request) error {
+	if request == nil || request.URL == nil || request.URL.User != nil || request.URL.Opaque != "" || request.URL.Fragment != "" || request.URL.RawFragment != "" {
+		return errors.New("invalid request URL")
+	}
+	if !strings.EqualFold(request.URL.Scheme, "https") {
+		return errors.New("rewritten request URL must use HTTPS")
+	}
+	if _, err := url.QueryUnescape(request.URL.RawQuery); err != nil {
+		return fmt.Errorf("invalid request URL query: %w", err)
+	}
+	host, port, err := parseAuthority(request.URL.Host, 443)
+	if err != nil {
+		return err
+	}
+	target := *request.URL
+	target.Scheme = "https"
+	target.Host = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	request.URL = &target
+	if !validMethod(request.Method) || request.Method == http.MethodConnect || request.Method == "PRI" {
+		return errors.New("invalid or unsupported rewritten method")
+	}
+	return nil
+}
+
+func validMethod(method string) bool {
+	if method == "" {
+		return false
+	}
+	for i := 0; i < len(method); i++ {
+		c := method[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c))) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameURLAuthority(a, b string) bool {
+	aHost, aPort, aErr := parseAuthority(a, 443)
+	bHost, bPort, bErr := parseAuthority(b, 443)
+	return aErr == nil && bErr == nil && normalizeDomain(aHost) == normalizeDomain(bHost) && aPort == bPort
 }
 
 func closeOnContextDone(ctx context.Context, closeConn func()) func() {
@@ -345,6 +854,10 @@ func metadataForURL(base *C.Metadata, target *url.URL, originalHost string) (*C.
 	if ip, err := netip.ParseAddr(host); err == nil {
 		metadata.Host = ""
 		metadata.DstIP = ip.Unmap()
+		metadata.DNSMode = C.DNSNormal
+		metadata.RawDstAddr = nil
+		metadata.DstGeoIP = nil
+		metadata.DstIPASN = ""
 	} else {
 		metadata.Host = host
 		if normalizeDomain(host) != normalizeDomain(originalHost) {
@@ -452,9 +965,14 @@ func (roundTripper *nativeRoundTripper) RoundTrip(request *http.Request) (*http.
 				return nil, fmt.Errorf("parse upstream TLS address %q: %w", address, err)
 			}
 			serverTLSConfig := tlsConfig.Clone()
-			if serverTLSConfig.ServerName == "" {
-				serverTLSConfig.ServerName = strings.Trim(host, "[]")
+			// The request URL is the source of truth after URL Rewrite. Use its
+			// hostname for both SNI and certificate verification even when the
+			// physical Native Dialer connects through a different address.
+			serverName := request.URL.Hostname()
+			if serverName == "" {
+				serverName = strings.Trim(host, "[]")
 			}
+			serverTLSConfig.ServerName = serverName
 			handshakeCtx, cancel := context.WithTimeout(requestCtx, roundTripper.handshakeTimeout)
 			defer cancel()
 			handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {

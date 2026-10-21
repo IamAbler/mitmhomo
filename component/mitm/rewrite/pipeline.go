@@ -9,6 +9,12 @@ import (
 var _ RequestPipeline = (*Snapshot)(nil)
 var _ ResponsePipeline = (*Snapshot)(nil)
 
+// HasRequestRules reports whether this snapshot contains request-phase actions.
+// It lets HTTP adapters skip request conversion for response-only/empty rules.
+func (s *Snapshot) HasRequestRules() bool {
+	return s != nil && s.hasRequestRules
+}
+
 // ApplyRequest matches each rule against the progressively rewritten request.
 // It never mutates the input; unchanged Headers remain borrowed from the caller.
 func (s *Snapshot) ApplyRequest(ctx context.Context, request RequestView) (RequestResult, error) {

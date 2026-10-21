@@ -35,7 +35,10 @@ type compiledRule struct {
 
 // Snapshot owns private compiled rules. It has no mutation API and is safe for
 // concurrent use. Compile preserves configuration order, with no priority sort.
-type Snapshot struct{ rules []compiledRule }
+type Snapshot struct {
+	rules           []compiledRule
+	hasRequestRules bool
+}
 
 // Compile validates even disabled rules, but a disabled configuration does not
 // compile or validate its contents (matching the optional M1 enable gate).
@@ -71,6 +74,9 @@ func Compile(config Config) (*Snapshot, error) {
 		used += size
 		if rule.Enabled == nil || *rule.Enabled {
 			s.rules = append(s.rules, compiled)
+			if compiled.request != nil || compiled.terminal != nil {
+				s.hasRequestRules = true
+			}
 		}
 	}
 	return s, nil
@@ -320,7 +326,7 @@ func validateHeader(k, v string) error {
 		return fmt.Errorf("invalid header %q", k)
 	}
 	switch strings.ToLower(k) {
-	case "host", "content-length", "transfer-encoding", "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade":
+	case "host", "content-length", "transfer-encoding", "connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-authentication-info", "te", "trailer", "upgrade":
 		return fmt.Errorf("managed or hop-by-hop header %q is forbidden", k)
 	}
 	return nil

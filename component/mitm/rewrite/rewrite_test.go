@@ -26,6 +26,38 @@ func compile(t *testing.T, rules ...Rule) *Snapshot {
 }
 func basicRule() Rule { return Rule{Name: "basic", Request: &RequestAction{Method: "POST"}} }
 
+func TestHasRequestRulesIsPrecomputedFromEnabledSnapshot(t *testing.T) {
+	disabled := false
+	cases := []struct {
+		name   string
+		config Config
+		want   bool
+	}{
+		{name: "nil snapshot"},
+		{name: "disabled config", config: Config{Rules: []Rule{basicRule()}}},
+		{name: "empty snapshot", config: Config{Enable: true}},
+		{name: "response only", config: Config{Enable: true, Rules: []Rule{{Name: "response", Response: &ResponseAction{Status: 204}}}}},
+		{name: "disabled request rule", config: Config{Enable: true, Rules: []Rule{{Name: "disabled", Enabled: &disabled, Request: &RequestAction{Method: "POST"}}}}},
+		{name: "request rule", config: Config{Enable: true, Rules: []Rule{basicRule()}}, want: true},
+		{name: "terminal rule", config: Config{Enable: true, Rules: []Rule{{Name: "local", LocalResponse: &LocalResponse{Status: 200}}}}, want: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var snapshot *Snapshot
+			if test.name != "nil snapshot" {
+				var err error
+				snapshot, err = Compile(test.config)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := snapshot.HasRequestRules(); got != test.want {
+				t.Fatalf("HasRequestRules() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRequestOrderAndTermination(t *testing.T) {
 	s := compile(t,
 		Rule{Name: "move", Match: Match{Domains: []string{"a.example"}}, Request: &RequestAction{URL: "https://b.example/v2", Method: "POST", Headers: HeaderAction{Set: map[string]string{"X-Step": "one"}, Remove: []string{"X-Old"}}, Body: &BodyReplacement{Replace: "first"}}},
@@ -181,6 +213,16 @@ func TestInvalidRules(t *testing.T) {
 			r.Request.Headers.Remove = []string{name}
 			if _, err := Compile(Config{Enable: true, Rules: []Rule{r}}); err == nil {
 				t.Fatal("managed header accepted")
+			}
+		})
+	}
+	for _, name := range []string{"Content-Length", "Transfer-Encoding", "Trailer", "Connection", "Upgrade"} {
+		t.Run("terminal managed header "+name, func(t *testing.T) {
+			_, err := Compile(Config{Enable: true, Rules: []Rule{{
+				Name: "local", LocalResponse: &LocalResponse{Status: 200, Headers: map[string]string{name: "unsafe"}},
+			}}})
+			if err == nil {
+				t.Fatalf("terminal response accepted managed header %q", name)
 			}
 		})
 	}

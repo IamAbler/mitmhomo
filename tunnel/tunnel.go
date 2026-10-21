@@ -119,7 +119,7 @@ func (t tunnel) dialMITMNativeTCP(ctx context.Context, metadata *C.Metadata, han
 
 	prepared := metadata.Clone()
 	fixMetadata(prepared)
-	if err := preHandleMetadata(prepared); err != nil {
+	if err := preHandleMITMMetadata(prepared); err != nil {
 		return nil, fmt.Errorf("MITM outbound Metadata preprocessing: %w", err)
 	}
 	proxy, rule, err := resolveMetadataContext(dialCtx, prepared)
@@ -408,24 +408,44 @@ func needLookupIP(metadata *C.Metadata) bool {
 }
 
 func preHandleMetadata(metadata *C.Metadata) error {
+	return preHandleMetadataWithExplicitIP(metadata, false)
+}
+
+// preHandleMITMMetadata keeps an explicit IP URL target from being reverse
+// mapped to a hostname associated with the inbound connection. Domain targets
+// still pass through the normal Hosts and mapping preprocessing path.
+func preHandleMITMMetadata(metadata *C.Metadata) error {
+	if metadata == nil {
+		return errors.New("MITM outbound Metadata is nil")
+	}
+	preserveExplicitIP := metadata.Host == "" && metadata.DstIP.IsValid()
+	return preHandleMetadataWithExplicitIP(metadata, preserveExplicitIP)
+}
+
+func preHandleMetadataWithExplicitIP(metadata *C.Metadata, preserveExplicitIP bool) error {
+	if metadata == nil {
+		return errors.New("Metadata is nil")
+	}
 	// preprocess enhanced-mode metadata
 	if needLookupIP(metadata) {
-		host, exist := resolver.FindHostByIP(metadata.DstIP)
-		if exist {
-			metadata.Host = host
-			metadata.DNSMode = C.DNSMapping
-			if resolver.IsFakeIP(metadata.DstIP) {
-				// only clear dstIP if it is confirmed to be a fake IP
-				metadata.DstIP = netip.Addr{}
-				metadata.DNSMode = C.DNSFakeIP
-			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
-				// redir-host should lookup the hosts
-				metadata.DstIP, _ = node.RandIP()
-			} else if node != nil && node.IsDomain {
-				metadata.Host = node.Domain
+		if !preserveExplicitIP {
+			host, exist := resolver.FindHostByIP(metadata.DstIP)
+			if exist {
+				metadata.Host = host
+				metadata.DNSMode = C.DNSMapping
+				if resolver.IsFakeIP(metadata.DstIP) {
+					// only clear dstIP if it is confirmed to be a fake IP
+					metadata.DstIP = netip.Addr{}
+					metadata.DNSMode = C.DNSFakeIP
+				} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
+					// redir-host should lookup the hosts
+					metadata.DstIP, _ = node.RandIP()
+				} else if node != nil && node.IsDomain {
+					metadata.Host = node.Domain
+				}
+			} else if resolver.IsFakeIP(metadata.DstIP) {
+				return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
 			}
-		} else if resolver.IsFakeIP(metadata.DstIP) {
-			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
 		}
 	} else if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
 		// try use domain mapping

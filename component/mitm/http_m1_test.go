@@ -65,6 +65,10 @@ func makeTestAuthority(t *testing.T) (*CertificateAuthority, *x509.CertPool) {
 }
 
 func makeTestUpstreamCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	return makeTestUpstreamCertificateFor(t, "localhost")
+}
+
+func makeTestUpstreamCertificateFor(t *testing.T, serverName string) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
@@ -73,13 +77,13 @@ func makeTestUpstreamCertificate(t *testing.T) (tls.Certificate, *x509.CertPool)
 	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "localhost"},
+		Subject:               pkix.Name{CommonName: serverName},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(24 * time.Hour),
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:              []string{"localhost"},
+		DNSNames:              []string{serverName},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	require.NoError(t, err)

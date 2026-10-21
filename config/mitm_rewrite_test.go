@@ -88,6 +88,9 @@ func TestRewriteYAMLRejectsInvalidActions(t *testing.T) {
 	for _, test := range []struct{ name, from, to string }{
 		{"URL", "https://b.example/v2", "http://b.example/v2"},
 		{"header", "X-Stage: one", "Content-Length: one"},
+		{"terminal framing header", "Content-Type: text/plain", "Content-Type: text/plain\n            Content-Length: 20"},
+		{"terminal transfer encoding", "Content-Type: text/plain", "Content-Type: text/plain\n            Transfer-Encoding: chunked"},
+		{"terminal trailer", "Content-Type: text/plain", "Content-Type: text/plain\n            Trailer: X-End"},
 		{"status", "status: 200", "status: 600"},
 		{"method", "method: POST", "method: bad method"},
 		{"path regex", "path-prefix: /v1/", "path-regex: '['"},
