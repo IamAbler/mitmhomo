@@ -119,10 +119,10 @@ type RequestResult struct {
 	Terminal *TerminalResponse
 }
 
-// SuppressBody forbids sending both the upstream body and replacement content.
-// Adapters must enforce it independently of Changed, and manage protocol framing
-// (including Transfer-Encoding/trailers). For HEAD/304, a replacement may be
-// used to set representation metadata such as Content-Length without sending it.
+// SuppressBody describes body suppression for the request view and final status.
+// Protocol adapters reconcile it with the original client method when a rewrite
+// changes HEAD semantics, and manage framing independently of Changed. For
+// HEAD/304, replacement content can describe metadata without being transmitted.
 type ResponseResult struct {
 	SuppressBody bool
 	Response     ResponseView

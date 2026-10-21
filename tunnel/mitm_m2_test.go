@@ -349,6 +349,7 @@ func TestM23ResponseRewriteUsesDIRECTAndPROXYNativeOutbound(t *testing.T) {
 			Request: &rewrite.RequestAction{
 				URL:     "https://example.com/new?m2=m3",
 				Method:  http.MethodPatch,
+				Body:    &rewrite.BodyReplacement{Replace: "native-upload", ContentType: "text/plain"},
 				Headers: rewrite.HeaderAction{Set: map[string]string{"X-Request-Rewrite": "active"}},
 			},
 		},
@@ -422,6 +423,9 @@ func TestM23ResponseRewriteUsesDIRECTAndPROXYNativeOutbound(t *testing.T) {
 		select {
 		case request := <-observed:
 			require.Equal(t, http.MethodPatch, request.method)
+			require.Equal(t, "native-upload", request.body)
+			require.Equal(t, "text/plain", request.header.Get("Content-Type"))
+			require.Equal(t, "13", request.header.Get("Content-Length"))
 			require.Equal(t, "/new?m2=m3", request.path)
 			require.Equal(t, "example.com:443", request.host)
 			require.Equal(t, "example.com", request.sni)

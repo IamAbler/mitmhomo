@@ -41,7 +41,16 @@ func applyResponseRewrite(ctx context.Context, request rewrite.RequestView, resp
 			return fmt.Errorf("apply response rewrite: %w", err)
 		}
 	}
-	result.SuppressBody = result.SuppressBody || downstreamMethod == http.MethodHead
+	// Wire semantics follow the client method, which may differ from the
+	// rewritten outbound method. A HEAD upstream has no body to forward, but
+	// a non-HEAD client may still receive an explicit static replacement.
+	result.SuppressBody = downstreamMethod == http.MethodHead || responseForbidsBody(result.Response.StatusCode)
+	if request.Method == http.MethodHead && downstreamMethod != http.MethodHead && result.Body == nil && !result.SuppressBody {
+		// The upstream length describes a GET representation, not the empty stream.
+		response.ContentLength = 0
+		result.Response.Headers["Content-Length"] = []string{"0"}
+		forceAdapter = true
+	}
 	if !result.Changed && !result.SuppressBody && !forceAdapter {
 		return nil
 	}
