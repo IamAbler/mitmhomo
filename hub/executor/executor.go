@@ -21,6 +21,7 @@ import (
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/keepalive"
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/profile"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -99,6 +100,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUsers(cfg.Users)
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
+	updateMITM(cfg.MITM)
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
@@ -365,6 +367,16 @@ func updateSniffer(snifferConfig *sniffer.Config) {
 	} else {
 		log.Infoln("Sniffer is closed")
 	}
+}
+
+func updateMITM(mitmConfig *mitm.Config) {
+	if mitmConfig == nil || !mitmConfig.Enabled {
+		tunnel.UpdateMITMManager(nil)
+		log.Infoln("HTTPS MITM is closed")
+		return
+	}
+	tunnel.UpdateMITMManager(mitm.NewManager(*mitmConfig))
+	log.Infoln("HTTPS MITM is loaded and working")
 }
 
 func updateTunnels(tunnels []LC.Tunnel) {

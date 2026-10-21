@@ -10,12 +10,14 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/loopback"
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/proxydialer"
@@ -66,6 +68,7 @@ var (
 
 	snifferDispatcher *sniffer.Dispatcher
 	sniffingEnable    = false
+	mitmDispatcher    stdatomic.Pointer[mitm.Manager]
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
 )
@@ -80,6 +83,110 @@ var _ proxydialer.Tunnel = Tunnel
 func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 	connCtx := icontext.NewConnContext(conn, metadata)
 	handleTCPConn(connCtx)
+}
+
+// UpdateMITMManager atomically publishes the active optional dispatcher.
+// A nil manager disables MITM without adding reads to native TCP handling.
+func UpdateMITMManager(manager *mitm.Manager) {
+	mitmDispatcher.Store(manager)
+}
+
+// DialTCP reuses Mihomo's native metadata preprocessing, rule selection,
+// retry, proxy dialing, and statistics path for one MITM HTTP request.
+func (t tunnel) DialTCP(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
+	return t.dialMITMNativeTCP(ctx, metadata, nil)
+}
+
+// DialTCPWithTLSHandshake lets the MITM HTTP transport complete upstream TLS
+// inside the native retry path when a proxy returns an EarlyConn. For ordinary
+// connections the handshake is completed after the native TCP dial succeeds.
+func (t tunnel) DialTCPWithTLSHandshake(ctx context.Context, metadata *C.Metadata, handshake mitm.NativeTLSHandshake) (net.Conn, error) {
+	if handshake == nil {
+		return nil, errors.New("MITM upstream TLS handshake is unavailable")
+	}
+	return t.dialMITMNativeTCP(ctx, metadata, handshake)
+}
+
+func (t tunnel) dialMITMNativeTCP(ctx context.Context, metadata *C.Metadata, handshake mitm.NativeTLSHandshake) (net.Conn, error) {
+	if metadata == nil || !metadata.Valid() {
+		return nil, errors.New("MITM outbound Metadata is invalid")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, C.DefaultTCPTimeout)
+	defer cancel()
+
+	prepared := metadata.Clone()
+	fixMetadata(prepared)
+	if err := preHandleMetadata(prepared); err != nil {
+		return nil, fmt.Errorf("MITM outbound Metadata preprocessing: %w", err)
+	}
+	proxy, rule, err := resolveMetadataContext(dialCtx, prepared)
+	if err != nil {
+		return nil, fmt.Errorf("MITM outbound route selection: %w", err)
+	}
+	if proxy == nil {
+		return nil, errors.New("MITM outbound route selected no proxy")
+	}
+	dialMetadata := nativeDialMetadata(prepared)
+	type dialResult struct {
+		remote  C.Conn
+		tracked C.Conn
+		conn    net.Conn
+	}
+	result, err := retry(dialCtx, func(attemptCtx context.Context) (dialResult, error) {
+		remoteConn, err := proxy.DialContext(attemptCtx, dialMetadata)
+		if err != nil {
+			return dialResult{}, err
+		}
+		if handshake == nil || !N.NeedHandshake(remoteConn) {
+			return dialResult{remote: remoteConn}, nil
+		}
+
+		// Native handleTCPConn primes an EarlyConn with the client's first
+		// bytes before installing its tracker. MITM has no inbound payload to
+		// reuse: the upstream TLS ClientHello is the correct first write, so
+		// complete that handshake under retry with tracking already active.
+		tracked := statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, prepared, rule, 0, 0, true)
+		secureConn, handshakeErr := handshake(attemptCtx, tracked)
+		if handshakeErr != nil {
+			_ = tracked.Close()
+			return dialResult{}, fmt.Errorf("MITM upstream TLS handshake: %w", handshakeErr)
+		}
+		if secureConn == nil {
+			_ = tracked.Close()
+			return dialResult{}, errors.New("MITM upstream TLS handshake returned a nil connection")
+		}
+		return dialResult{tracked: tracked, conn: secureConn}, nil
+	}, func(dialErr error) {
+		logMetadataErr(prepared, rule, proxy, dialErr)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result.tracked != nil {
+		logMetadata(prepared, rule, result.tracked)
+		return result.conn, nil
+	}
+	if result.remote == nil {
+		return nil, errors.New("MITM native outbound returned no connection")
+	}
+	logMetadata(prepared, rule, result.remote)
+	tracked := statistic.NewTCPTracker(result.remote, statistic.DefaultManager, prepared, rule, 0, 0, true)
+	if handshake == nil {
+		return tracked, nil
+	}
+	secureConn, err := handshake(dialCtx, tracked)
+	if err != nil {
+		_ = tracked.Close()
+		return nil, fmt.Errorf("MITM upstream TLS handshake: %w", err)
+	}
+	if secureConn == nil {
+		_ = tracked.Close()
+		return nil, errors.New("MITM upstream TLS handshake returned a nil connection")
+	}
+	return secureConn, nil
 }
 
 func initUDP() {
@@ -282,6 +389,20 @@ func fixMetadata(metadata *C.Metadata) {
 	}
 }
 
+func nativeDialMetadata(metadata *C.Metadata) *C.Metadata {
+	dialMetadata := metadata
+	if metadata != nil && len(metadata.Host) > 0 {
+		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+			if dstIP, _ := node.RandIP(); !resolver.IsFakeIP(dstIP) {
+				metadata.DstIP = dstIP
+				metadata.DNSMode = C.DNSHosts
+				dialMetadata = dialMetadata.Pure()
+			}
+		}
+	}
+	return dialMetadata
+}
+
 func needLookupIP(metadata *C.Metadata) bool {
 	return resolver.MappingEnabled() && metadata.Host == "" && metadata.DstIP.IsValid()
 }
@@ -314,7 +435,38 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
+func prepareMITMOrigin(metadata *C.Metadata, hello *sniffer.TLSClientHelloInfo) (*C.Metadata, error) {
+	if metadata == nil || hello == nil || hello.ServerName == "" {
+		return nil, errors.New("MITM origin requires Metadata and SNI")
+	}
+	origin := metadata.Clone()
+	if resolver.IsFakeIP(origin.DstIP) {
+		// A missing Fake-IP mapping remains a failed pre-handle on the original
+		// Metadata. A configured, validated SNI may recover only this independent
+		// origin copy, followed by the normal pre-handle.
+		origin.DstIP = netip.Addr{}
+		origin.DNSMode = C.DNSNormal
+		origin.Host = hello.ServerName
+	} else if origin.Host == "" {
+		origin.Host = hello.ServerName
+	}
+	if err := preHandleMetadata(origin); err != nil {
+		return nil, err
+	}
+	if !origin.Valid() {
+		return nil, errors.New("MITM origin Metadata is invalid after preprocessing")
+	}
+	return origin, nil
+}
+
 func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+	return resolveMetadataContext(context.Background(), metadata)
+}
+
+func resolveMetadataContext(ctx context.Context, metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if metadata.SpecialProxy != "" {
 		var exist bool
 		proxy, exist = proxies[metadata.SpecialProxy]
@@ -336,9 +488,9 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 	helper := C.RuleMatchHelper{
 		ResolveIP: func() {
 			if !resolved && metadata.Host != "" && !metadata.Resolved() {
-				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+				lookupCtx, cancel := context.WithTimeout(ctx, resolver.DefaultDNSTimeout)
 				defer cancel()
-				ip, err := resolver.ResolveIP(ctx, metadata.Host)
+				ip, err := resolver.ResolveIP(lookupCtx, metadata.Host)
 				if err != nil {
 					log.Debugln("[DNS] resolve %s error: %s", metadata.Host, err.Error())
 				} else {
@@ -405,7 +557,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		proxy = proxies["GLOBAL"]
 	// Rule
 	default:
-		proxy, rule, err = match(metadata, helper)
+		proxy, rule, err = matchContext(ctx, metadata, helper)
 	}
 	return
 }
@@ -499,6 +651,13 @@ func handleUDPConn(packet C.PacketAdapter) {
 	sender.Send(packet) // nonblocking
 }
 
+func snapshotMITMMetadata(manager *mitm.Manager, metadata *C.Metadata) (*C.Metadata, bool) {
+	if manager == nil || metadata == nil || !manager.ShouldInspect(metadata.DstPort) {
+		return nil, false
+	}
+	return metadata.Clone(), true
+}
+
 func handleTCPConn(connCtx C.ConnContext) {
 	if !isHandle(connCtx.Metadata().Type) {
 		_ = connCtx.Conn().Close()
@@ -515,6 +674,8 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
+	manager := mitmDispatcher.Load()
+	mitmCheckMetadata, mitmShouldInspect := snapshotMITMMetadata(manager, metadata)
 
 	preHandleFailed := false
 	if err := preHandleMetadata(metadata); err != nil {
@@ -530,6 +691,22 @@ func handleTCPConn(connCtx C.ConnContext) {
 		if snifferDispatcher.TCPSniff(conn, metadata) {
 			// we now have a domain name
 			preHandleFailed = false
+			// Preserve the existing Sniffer override decision when it ran.
+			if mitmShouldInspect {
+				mitmCheckMetadata = metadata.Clone()
+			}
+		}
+	}
+
+	if mitmShouldInspect {
+		outcome, mitmErr := manager.Dispatch(context.Background(), conn, mitmCheckMetadata, func(hello *sniffer.TLSClientHelloInfo) (*C.Metadata, error) {
+			return prepareMITMOrigin(metadata, hello)
+		}, Tunnel.DialTCPWithTLSHandshake)
+		if mitmErr != nil {
+			log.Debugln("[MITM] connection handling error: %s", mitmErr)
+		}
+		if outcome != mitm.DispatchUnmatched || mitmErr != nil {
+			return
 		}
 	}
 
@@ -557,16 +734,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
-	dialMetadata := metadata
-	if len(metadata.Host) > 0 {
-		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
-			if dstIp, _ := node.RandIP(); !resolver.IsFakeIP(dstIp) {
-				dialMetadata.DstIP = dstIp
-				dialMetadata.DNSMode = C.DNSHosts
-				dialMetadata = dialMetadata.Pure()
-			}
-		}
-	}
+	dialMetadata := nativeDialMetadata(metadata)
 
 	var peekBytes []byte
 	var peekLen int
@@ -652,6 +820,13 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 }
 
 func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
+	return matchContext(context.Background(), metadata, helper)
+}
+
+func matchContext(ctx context.Context, metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	configMux.RLock()
 	defer configMux.RUnlock()
 
@@ -695,7 +870,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 				return rematchProxy, rematchRule, nil
 			}
 			rematchChain = append(rematchChain, rematchProxy.Name())
-			conn, err := rematchProxy.DialContext(context.Background(), metadata) // not a real connection, just for metadata update
+			conn, err := rematchProxy.DialContext(ctx, metadata) // not a real connection, just for metadata update
 			if conn != nil {
 				_ = conn.Close()
 			}

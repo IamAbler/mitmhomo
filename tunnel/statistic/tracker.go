@@ -3,6 +3,7 @@ package statistic
 import (
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
@@ -37,6 +38,9 @@ type tcpTracker struct {
 	C.Conn `json:"-"`
 	*TrackerInfo
 	manager *Manager
+
+	closeOnce sync.Once
+	closeErr  error
 
 	pushToManager bool `json:"-"`
 }
@@ -108,8 +112,11 @@ func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 }
 
 func (tt *tcpTracker) Close() error {
-	tt.manager.Leave(tt)
-	return tt.Conn.Close()
+	tt.closeOnce.Do(func() {
+		tt.manager.Leave(tt)
+		tt.closeErr = tt.Conn.Close()
+	})
+	return tt.closeErr
 }
 
 func (tt *tcpTracker) Upstream() any {

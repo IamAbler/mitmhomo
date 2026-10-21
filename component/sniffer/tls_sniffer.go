@@ -21,8 +21,18 @@ const (
 	tlsHandshakeHeaderLen       = 4
 	tlsRecordTypeHandshake      = 0x16
 	tlsHandshakeTypeClientHello = 0x01
+	tlsExtensionEncryptedClient = 0xfe0d
 	tlsMaxPlaintext             = 1 << 14
 )
+
+// TLSClientHelloInfo contains the fields the MITM dispatcher needs from a
+// ClientHello. HasECH reports the presence of the Encrypted ClientHello
+// extension; it does not claim that an outer ServerName identifies the
+// encrypted inner name.
+type TLSClientHelloInfo struct {
+	ServerName string
+	HasECH     bool
+}
 
 type errNeedAtLeastData struct {
 	length int
@@ -78,6 +88,21 @@ func IsValidTLSVersion(major, minor byte) bool {
 // available in a ClientHello prefix, including the four-byte handshake header.
 // https://github.com/golang/go/blob/master/src/crypto/tls/handshake_messages.go#L300
 func ReadClientHello(data []byte) (*string, error) {
+	info, err := readClientHello(data, false)
+	if err != nil {
+		return nil, err
+	}
+	return &info.ServerName, nil
+}
+
+// ReadClientHelloInfo parses a complete ClientHello handshake message. Unlike
+// ReadClientHello, it waits for all extensions so an ECH extension appearing
+// after server_name cannot be missed.
+func ReadClientHelloInfo(data []byte) (*TLSClientHelloInfo, error) {
+	return readClientHello(data, true)
+}
+
+func readClientHello(data []byte, requireComplete bool) (*TLSClientHelloInfo, error) {
 	if len(data) == 0 {
 		return nil, &errNeedAtLeastData{length: 1, err: ErrNoClue}
 	}
@@ -158,6 +183,7 @@ func ReadClientHello(data []byte) (*string, error) {
 		return nil, errNotClientHello
 	}
 
+	info := &TLSClientHelloInfo{}
 	for offset < extensionsEnd {
 		if err := need(offset + 4); err != nil {
 			return nil, err
@@ -168,6 +194,9 @@ func ReadClientHello(data []byte) (*string, error) {
 		extensionEnd := offset + length
 		if extensionEnd > extensionsEnd {
 			return nil, errNotClientHello
+		}
+		if extension == tlsExtensionEncryptedClient {
+			info.HasECH = true
 		}
 
 		if extension == 0x00 { /* extensionServerName */
@@ -205,13 +234,15 @@ func ReadClientHello(data []byte) (*string, error) {
 					if strings.HasSuffix(serverName, ".") {
 						return nil, errNotClientHello
 					}
-
-					return &serverName, nil
+					info.ServerName = serverName
+					if !requireComplete {
+						return info, nil
+					}
 				}
 				offset = nameEnd
 			}
 		} else {
-			if extensionEnd == extensionsEnd {
+			if extensionEnd == extensionsEnd && info.ServerName == "" {
 				// This is the last extension, so its payload cannot contain a
 				// later server_name extension that changes the verdict.
 				return nil, errNotTLS
@@ -223,6 +254,9 @@ func ReadClientHello(data []byte) (*string, error) {
 		}
 	}
 
+	if info.ServerName != "" {
+		return info, nil
+	}
 	return nil, errNotTLS
 }
 
@@ -239,6 +273,20 @@ func clientHelloSize(data []byte) (int, error) {
 }
 
 func SniffTLS(b []byte) (*string, error) {
+	info, err := sniffTLS(b, false)
+	if err != nil {
+		return nil, err
+	}
+	return &info.ServerName, nil
+}
+
+// SniffTLSInfo returns SNI and ECH presence from a complete ClientHello. It
+// shares the existing record and handshake parser with SniffTLS.
+func SniffTLSInfo(b []byte) (*TLSClientHelloInfo, error) {
+	return sniffTLS(b, true)
+}
+
+func sniffTLS(b []byte, requireComplete bool) (*TLSClientHelloInfo, error) {
 	var clientHello []byte
 	wireOffset := 0
 
@@ -282,9 +330,15 @@ func SniffTLS(b []byte) (*string, error) {
 			clientHello = append(clientHello, payload...)
 		}
 
-		domain, err := ReadClientHello(clientHello)
+		var info *TLSClientHelloInfo
+		var err error
+		if requireComplete {
+			info, err = ReadClientHelloInfo(clientHello)
+		} else {
+			info, err = readClientHello(clientHello, false)
+		}
 		if err == nil {
-			return domain, nil
+			return info, nil
 		}
 		var need *errNeedAtLeastData
 		if !errors.As(err, &need) {

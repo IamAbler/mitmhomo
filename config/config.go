@@ -23,6 +23,7 @@ import (
 	"github.com/metacubex/mihomo/component/cidr"
 	"github.com/metacubex/mihomo/component/fakeip"
 	"github.com/metacubex/mihomo/component/geodata"
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/sniffer"
@@ -211,6 +212,7 @@ type Config struct {
 	Tunnels       []LC.Tunnel
 	Sniffer       *sniffer.Config
 	TLS           *TLS
+	MITM          *mitm.Config
 }
 
 type RawCors struct {
@@ -466,6 +468,7 @@ type RawConfig struct {
 	GeoXUrl       RawGeoXUrl                `yaml:"geox-url" json:"geox-url"`
 	Sniffer       RawSniffer                `yaml:"sniffer" json:"sniffer"`
 	TLS           RawTLS                    `yaml:"tls" json:"tls"`
+	MITM          RawMITM                   `yaml:"mitm" json:"mitm"`
 
 	ClashForAndroid RawClashForAndroid `yaml:"clash-for-android" json:"clash-for-android"`
 }
@@ -673,6 +676,12 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 	config.TLS = tlsCfg
+
+	mitmCfg, err := parseMITM(rawCfg.MITM)
+	if err != nil {
+		return nil, err
+	}
+	config.MITM = mitmCfg
 
 	proxies, providers, err := parseProxies(rawCfg)
 	if err != nil {
