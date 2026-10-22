@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/metacubex/mihomo/component/mitm/jsruntime"
+	"github.com/metacubex/mihomo/component/mitm/scriptapi"
+	C "github.com/metacubex/mihomo/constant"
 	domainname "github.com/metacubex/sing/common/metadata"
 )
 
@@ -23,14 +26,17 @@ const (
 	MaxBodyBytes        = 1 << 20
 	maxSourceBytes      = 256 << 10
 	maxConcurrentHooks  = 4
+	maxScriptNameBytes  = 128
 )
 
 // Config is disabled unless Enable is true. Rules are evaluated in order; the
 // first matching rule for a request or response phase runs once.
 type Config struct {
-	Enable       bool   `yaml:"enable" json:"enable"`
-	MaxBodyBytes int    `yaml:"max-body-bytes" json:"max-body-bytes"`
-	Rules        []Rule `yaml:"rules" json:"rules"`
+	Enable               bool   `yaml:"enable" json:"enable"`
+	MaxBodyBytes         int    `yaml:"max-body-bytes" json:"max-body-bytes"`
+	ExecutionTimeout     int    `yaml:"execution-timeout" json:"execution-timeout"`
+	AllowPrivateNetworks bool   `yaml:"allow-private-networks" json:"allow-private-networks"`
+	Rules                []Rule `yaml:"rules" json:"rules"`
 }
 
 type Phase string
@@ -45,8 +51,21 @@ const (
 type Rule struct {
 	Name   string `yaml:"name" json:"name"`
 	Phase  Phase  `yaml:"phase" json:"phase"`
+	Mode   string `yaml:"mode" json:"mode"`
 	Match  Match  `yaml:"match" json:"match"`
 	Source string `yaml:"source" json:"source"`
+}
+
+const (
+	LegacyMode = "legacy"
+	APIMode    = "api"
+)
+
+type Services struct {
+	Store         scriptapi.PersistentStore
+	HTTPClients   scriptapi.HTTPClientFactory
+	Log           scriptapi.LogSink
+	Notifications scriptapi.Notifier
 }
 
 // Match deliberately supports only common HTTP predicates in this milestone.
@@ -74,6 +93,7 @@ type compiledMatch struct {
 type compiledRule struct {
 	name   string
 	phase  Phase
+	mode   string
 	match  compiledMatch
 	source string
 }
@@ -89,6 +109,7 @@ type Snapshot struct {
 	runtime   *jsruntime.Runtime
 	closed    bool
 	active    atomic.Int32
+	services  Services
 }
 
 // Compile validates and freezes configuration without creating a Runtime or
@@ -103,6 +124,12 @@ func Compile(config Config) (*Snapshot, error) {
 	if config.MaxBodyBytes < 1 || config.MaxBodyBytes > MaxBodyBytes {
 		return nil, fmt.Errorf("max-body-bytes must be between 1 and %d", MaxBodyBytes)
 	}
+	if config.ExecutionTimeout == 0 {
+		config.ExecutionTimeout = 10
+	}
+	if config.ExecutionTimeout < 1 || config.ExecutionTimeout > 30 {
+		return nil, fmt.Errorf("execution-timeout must be between 1 and 30 seconds")
+	}
 	if len(config.Rules) == 0 {
 		return nil, fmt.Errorf("enabled HTTP script hooks require at least one rule")
 	}
@@ -114,10 +141,19 @@ func Compile(config Config) (*Snapshot, error) {
 		if strings.TrimSpace(rule.Name) == "" {
 			return nil, fmt.Errorf("rules[%d].name is required", i)
 		}
+		if len(rule.Name) > maxScriptNameBytes {
+			return nil, fmt.Errorf("rules[%d].name is too long", i)
+		}
 		if _, exists := names[rule.Name]; exists {
 			return nil, fmt.Errorf("rules[%d].name %q is duplicated", i, rule.Name)
 		}
 		names[rule.Name] = struct{}{}
+		if rule.Mode == "" {
+			rule.Mode = LegacyMode
+		}
+		if rule.Mode != LegacyMode && rule.Mode != APIMode {
+			return nil, fmt.Errorf("rules[%d].mode must be legacy or api", i)
+		}
 		if rule.Phase != RequestPhase && rule.Phase != ResponsePhase {
 			return nil, fmt.Errorf("rules[%d].phase must be request or response", i)
 		}
@@ -128,7 +164,18 @@ func Compile(config Config) (*Snapshot, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rules[%d].match: %w", i, err)
 		}
-		snapshot.rules = append(snapshot.rules, compiledRule{name: rule.Name, phase: rule.Phase, match: match, source: rule.Source})
+		snapshot.rules = append(snapshot.rules, compiledRule{name: rule.Name, phase: rule.Phase, mode: rule.Mode, match: match, source: rule.Source})
+		config.Rules[i].Mode = rule.Mode
+	}
+	for _, rule := range snapshot.rules {
+		if rule.mode == APIMode {
+			store, err := scriptapi.SharedStore(filepath.Join(C.Path.HomeDir(), "script-store"))
+			if err != nil {
+				return nil, fmt.Errorf("initialize persistent script storage: %w", err)
+			}
+			snapshot.services.Store = store
+			break
+		}
 	}
 	return snapshot, nil
 }
@@ -156,7 +203,29 @@ func (s *Snapshot) Clone() *Snapshot {
 	if s == nil {
 		return nil
 	}
-	cloned, _ := Compile(s.config)
+	cloned, err := Compile(s.config)
+	if err != nil {
+		return nil
+	}
+	cloned.services = s.services
+	return cloned
+}
+
+// CloneWithServices returns a fresh immutable generation with the supplied
+// host services. Storage is shared by directory so config reloads retain data.
+func (s *Snapshot) CloneWithServices(services Services) *Snapshot {
+	cloned := s.Clone()
+	if cloned == nil {
+		return nil
+	}
+	if services.Store != nil {
+		cloned.services.Store = services.Store
+	}
+	cloned.services.HTTPClients = services.HTTPClients
+	if services.Log != nil {
+		cloned.services.Log = services.Log
+	}
+	cloned.services.Notifications = services.Notifications
 	return cloned
 }
 

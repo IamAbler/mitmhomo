@@ -375,6 +375,7 @@ func updateMITM(mitmConfig *mitm.Config) {
 		log.Infoln("HTTPS MITM is closed")
 		return
 	}
+	mitmConfig.ScriptServices.HTTPClients = tunnel.ScriptHTTPClientFactory
 	tunnel.UpdateMITMManager(mitm.NewManager(*mitmConfig))
 	log.Infoln("HTTPS MITM is loaded and working")
 }

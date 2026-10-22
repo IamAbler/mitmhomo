@@ -87,3 +87,34 @@ func TestHTTPHookMemoryLifecycleSnapshots(t *testing.T) {
 
 	t.Logf("M4.2 HTTP hook memory bytes (RSS=0 means unavailable): baseline=%+v configured=%+v first_run=%+v after_500=%+v closed_gc=%+v", baseline, configured, firstRun, steady, closed)
 }
+
+func TestHTTPHookAPIMemoryLifecycleSnapshots(t *testing.T) {
+	if testing.Short() {
+		t.Skip("memory lifecycle snapshot")
+	}
+	baseline := sampleHookMemory()
+	snapshot, err := Compile(Config{Enable: true, Rules: []Rule{{
+		Name: "api-memory", Phase: RequestPhase, Mode: APIMode, Match: Match{Path: "/api-memory"},
+		Source: `$done({headers: $request.headers, body: $request.body + "!"});`,
+	}}})
+	require.NoError(t, err)
+	configured := sampleHookMemory()
+	require.False(t, snapshot.RuntimeInitialized())
+
+	request, err := http.NewRequest(http.MethodPost, "https://memory.example.test/api-memory", strings.NewReader("bounded request body"))
+	require.NoError(t, err)
+	_, err = snapshot.ApplyRequest(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, snapshot.RuntimeInitialized())
+	firstRun := sampleHookMemory()
+
+	for i := 0; i < 500; i++ {
+		request.Body = io.NopCloser(strings.NewReader(fmt.Sprintf("request-%d", i)))
+		_, err = snapshot.ApplyRequest(context.Background(), request)
+		require.NoError(t, err)
+	}
+	steady := sampleHookMemory()
+	require.NoError(t, snapshot.Close())
+	closed := sampleHookMemory()
+	t.Logf("M4.3 API hook memory bytes (RSS=0 means unavailable): baseline=%+v configured=%+v first_run=%+v after_500=%+v closed_gc=%+v", baseline, configured, firstRun, steady, closed)
+}

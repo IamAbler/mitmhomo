@@ -40,6 +40,26 @@ func TestHTTPScriptYAMLAndLazySnapshot(t *testing.T) {
 	require.NoError(t, snapshot.Close())
 }
 
+func TestHTTPScriptAPIModeAndPrivateNetworkPolicy(t *testing.T) {
+	yaml := strings.Replace(httpScriptYAML, "    enable: true\n", "    enable: true\n    execution-timeout: 7\n    allow-private-networks: true\n", 1)
+	yaml = strings.Replace(yaml, "      - name: add-header\n        phase: request", "      - name: add-header\n        phase: request\n        mode: api", 1)
+	raw, err := UnmarshalRawConfig([]byte(yaml))
+	require.NoError(t, err)
+	snapshot, err := httphook.Compile(httphook.Config(raw.MITM.HTTPScript))
+	require.NoError(t, err)
+	require.Equal(t, 7, httphook.Config(raw.MITM.HTTPScript).ExecutionTimeout)
+	require.True(t, httphook.Config(raw.MITM.HTTPScript).AllowPrivateNetworks)
+	require.Equal(t, httphook.APIMode, httphook.Config(raw.MITM.HTTPScript).Rules[0].Mode)
+	require.NoError(t, snapshot.Close())
+
+	bad := RawMITM{Enable: true, Domains: []string{"api.example.test"}, HTTPScript: RawHTTPScript(httphook.Config{
+		Enable: true,
+		Rules:  []httphook.Rule{{Name: "bad-mode", Phase: httphook.RequestPhase, Mode: "surge", Source: `$done()`}},
+	})}
+	_, err = parseMITM(bad)
+	require.ErrorContains(t, err, "mode must be legacy or api")
+}
+
 func TestHTTPScriptYAMLRejectsUnknownFieldsAndInvalidRules(t *testing.T) {
 	unknown := strings.Replace(httpScriptYAML, "        phase: request", "        stage: request", 1)
 	_, err := UnmarshalRawConfig([]byte(unknown))

@@ -9,8 +9,57 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/metacubex/mihomo/component/mitm/scriptapi"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSharedStoreSurvivesSnapshotRuntimeClose(t *testing.T) {
+	directory := t.TempDir()
+	store, err := scriptapi.SharedStore(directory)
+	require.NoError(t, err)
+	defer store.Close()
+	base := testSnapshot(t, Config{Enable: true, Rules: []Rule{{
+		Name: "shared-generations", Phase: RequestPhase, Mode: APIMode,
+		Source: `$persistentStore.write($request.body, "key"); $done({body: $persistentStore.read("key")});`,
+	}}})
+	// Use the real production clone and API execution paths with isolated
+	// storage so this test never writes to the application's data directory.
+	old := base.CloneWithServices(Services{Store: store})
+	require.NotNil(t, old)
+	defer old.Close()
+	next := old.Clone()
+	require.NotNil(t, next)
+	defer next.Close()
+	require.Same(t, store, old.services.Store)
+	require.Same(t, store, next.services.Store)
+	oldRuntime, err := old.getRuntime()
+	require.NoError(t, err)
+	nextRuntime, err := next.getRuntime()
+	require.NoError(t, err)
+	require.NotSame(t, oldRuntime, nextRuntime)
+	apply := func(snapshot *Snapshot, body string) {
+		t.Helper()
+		request := testRequest(t, http.MethodPost, "https://example.test/", body)
+		defer request.Body.Close()
+		result, err := snapshot.ApplyRequest(context.Background(), request)
+		require.NoError(t, err)
+		require.Nil(t, result.Fallback)
+		require.True(t, result.Applied)
+		value, exists, err := store.Read("shared-generations", "key")
+		require.NoError(t, err)
+		require.True(t, exists)
+		require.Equal(t, body, value)
+	}
+	apply(old, "old")
+	apply(next, "new-before-close")
+	require.NoError(t, oldRuntime.Close())
+	apply(next, "new-after-runtime-close")
+	require.NoError(t, old.Close())
+	apply(next, "new-after-snapshot-close")
+	reopened, err := scriptapi.SharedStore(directory)
+	require.NoError(t, err)
+	require.Same(t, store, reopened)
+}
 
 func testSnapshot(t *testing.T, config Config) *Snapshot {
 	t.Helper()
@@ -65,6 +114,70 @@ func TestRequestHookMutationAndPassthrough(t *testing.T) {
 	replayed, err = io.ReadAll(other.Body)
 	require.NoError(t, err)
 	require.Equal(t, "untouched", string(replayed))
+}
+
+func TestAPIModeDoneMutatesRequestAndRejectsSecondCompletion(t *testing.T) {
+	snapshot := testSnapshot(t, Config{Enable: true, Rules: []Rule{{
+		Name: "api-request", Phase: RequestPhase, Mode: APIMode,
+		Source: `$request.headers["X-API"] = ["yes"]; $done({method: "PATCH", headers: $request.headers, body: $request.body + "-api"}); $done({body: "second"});`,
+	}}})
+	request := testRequest(t, http.MethodPost, "https://api.example.test/path", "original")
+	result, err := snapshot.ApplyRequest(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, result.Applied)
+	require.Nil(t, result.Fallback)
+	require.Equal(t, "PATCH", *result.Method)
+	require.Equal(t, "yes", (*result.Headers).Get("X-API"))
+	require.Equal(t, []byte("original-api"), result.Body)
+}
+
+func TestAPIModeDoneNoArgumentPassesThroughAndNoInputGlobal(t *testing.T) {
+	snapshot := testSnapshot(t, Config{Enable: true, Rules: []Rule{{
+		Name: "api-pass", Phase: RequestPhase, Mode: APIMode,
+		Source: `if (typeof input !== "undefined") throw new Error("legacy input leaked"); $request.method; $done();`,
+	}}})
+	request := testRequest(t, http.MethodGet, "https://api.example.test/path", "body")
+	result, err := snapshot.ApplyRequest(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, result.Matched)
+	require.False(t, result.Applied)
+	require.Nil(t, result.Fallback)
+}
+
+func TestAPIModeResponseReceivesRequestAndResponseAndUsesExistingValidation(t *testing.T) {
+	snapshot := testSnapshot(t, Config{Enable: true, Rules: []Rule{{
+		Name: "api-response", Phase: ResponsePhase, Mode: APIMode,
+		Source: `if ($request.url !== "https://api.example.test/path") throw new Error("request missing"); $done({status: $response.status + 1, headers: $response.headers, body: $response.body + "!"});`,
+	}}})
+	request := testRequest(t, http.MethodGet, "https://api.example.test/path", "")
+	response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"X-Input": []string{"before"}}, Body: io.NopCloser(strings.NewReader("response"))}
+	result, err := snapshot.ApplyResponse(context.Background(), request, response)
+	require.NoError(t, err)
+	require.True(t, result.Applied)
+	require.Equal(t, http.StatusCreated, *result.Status)
+	require.Equal(t, []byte("response!"), result.Body)
+
+	invalid := testSnapshot(t, Config{Enable: true, Rules: []Rule{{Name: "invalid", Phase: ResponsePhase, Mode: APIMode, Source: `$done({status: 101})`}}})
+	invalidResponse := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("original"))}
+	invalidResult, err := invalid.ApplyResponse(context.Background(), request, invalidResponse)
+	require.NoError(t, err)
+	require.False(t, invalidResult.Applied)
+	require.Error(t, invalidResult.Fallback)
+	replayed, err := io.ReadAll(invalidResponse.Body)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(replayed))
+}
+
+func TestAPIModeExceptionAfterDoneFallsBackToOriginal(t *testing.T) {
+	snapshot := testSnapshot(t, Config{Enable: true, Rules: []Rule{{
+		Name: "throw-after-done", Phase: RequestPhase, Mode: APIMode,
+		Source: `$done({body: "changed"}); throw new Error("after done");`,
+	}}})
+	request := testRequest(t, http.MethodPost, "https://api.example.test/path", "original")
+	result, err := snapshot.ApplyRequest(context.Background(), request)
+	require.NoError(t, err)
+	require.False(t, result.Applied)
+	require.ErrorContains(t, result.Fallback, "after done")
 }
 
 func TestRequestHookBinaryBodyUsesBase64AndRuntimeStateIsIsolated(t *testing.T) {
@@ -481,4 +594,13 @@ func TestCompileValidatesRulesAndDisabledConfigDoesNotCreateRuntime(t *testing.T
 	_, err = snapshot.ApplyRequest(context.Background(), request)
 	require.NoError(t, err)
 	require.False(t, snapshot.RuntimeInitialized())
+
+	apiSnapshot := testSnapshot(t, Config{Enable: true, Rules: []Rule{{
+		Name: "lazy-api", Phase: RequestPhase, Mode: APIMode,
+		Match: Match{Path: "/match"}, Source: `$done();`,
+	}}})
+	apiRequest := testRequest(t, http.MethodGet, "https://lazy.example.test/miss", "")
+	_, err = apiSnapshot.ApplyRequest(context.Background(), apiRequest)
+	require.NoError(t, err)
+	require.False(t, apiSnapshot.RuntimeInitialized(), "a configured but unmatched API rule must not create a Runtime")
 }

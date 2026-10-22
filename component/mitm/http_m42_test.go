@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,37 @@ func TestM42RequestAndResponseHooksHTTP11AndHTTP2(t *testing.T) {
 			require.Empty(t, notModifiedBody)
 			require.Equal(t, "yes", notModified.Header.Get("X-304-Hook"))
 			require.Empty(t, notModified.Header.Get("Transfer-Encoding"))
+		})
+	}
+}
+
+func TestM43APIHookRequestAndResponseHTTP11AndHTTP2(t *testing.T) {
+	for _, protocol := range []struct {
+		name         string
+		downstreamH2 bool
+		upstreamALPN []string
+	}{
+		{name: "http11", upstreamALPN: []string{"http/1.1"}},
+		{name: "http2", downstreamH2: true, upstreamALPN: []string{"h2"}},
+	} {
+		t.Run(protocol.name, func(t *testing.T) {
+			hooks := m42Hooks(t, httphook.Config{Enable: true, Rules: []httphook.Rule{
+				{Name: "api-request", Phase: httphook.RequestPhase, Mode: httphook.APIMode, Source: `$done({method: "PUT", body: $request.body + "-request"});`},
+				{Name: "api-response", Phase: httphook.ResponsePhase, Mode: httphook.APIMode, Source: `$done({status: $response.status + 1, body: $response.body + "-response"});`},
+			}})
+			upstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				_, _ = fmt.Fprintf(w, "%s|%s|%s", r.Method, r.URL.Path, body)
+			})
+			h := newProtocolHarness(t, nil, "localhost", 443, upstream, false, true, protocol.downstreamH2, protocol.upstreamALPN, func(c *Config) { c.ScriptHooks = hooks })
+			response, err := h.wire.RoundTrip(m42NewRequest(t, http.MethodPost, "/api", "payload"))
+			require.NoError(t, err)
+			body, err := io.ReadAll(response.Body)
+			require.NoError(t, err)
+			require.NoError(t, response.Body.Close())
+			require.Equal(t, http.StatusCreated, response.StatusCode)
+			require.Equal(t, "PUT|/api|payload-request-response", string(body))
 		})
 	}
 }
@@ -391,6 +423,117 @@ func TestM42RapidReloadKeepsPinnedGenerationAndClosesRetiredRuntime(t *testing.T
 	require.NoError(t, err)
 	require.Error(t, closedResult.Fallback, "closed generations reject new script work")
 	require.False(t, old.config.ScriptHooks.RuntimeInitialized(), "closed Runtime is not recreated")
+}
+
+func TestM43RetiredGenerationCancelsHTTPTasksWhenPinnedRequestEnds(t *testing.T) {
+	oldStarted := make(chan struct{})
+	oldCanceled := make(chan struct{})
+	newStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/old" {
+			close(oldStarted)
+			<-request.Context().Done()
+			close(oldCanceled)
+			return
+		}
+		close(newStarted)
+		_, _ = io.WriteString(w, "new generation")
+	}))
+	defer server.Close()
+	client := server.Client()
+	services := httphook.Services{HTTPClients: func(bool) (*http.Client, func(), error) { return client, nil, nil }}
+	oldHooks, err := httphook.Compile(httphook.Config{
+		Enable: true, AllowPrivateNetworks: true, ExecutionTimeout: 30,
+		Rules: []httphook.Rule{{
+			Name: "old-http", Phase: httphook.RequestPhase, Mode: httphook.APIMode,
+			Source: fmt.Sprintf(`$httpClient.get({url: %q}, function(error) { $done({headers: {"X-Callback": ["unexpected"]}}); });`, server.URL+"/old"),
+		}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = oldHooks.Close() })
+	newHooks, err := httphook.Compile(httphook.Config{
+		Enable: true, AllowPrivateNetworks: true, ExecutionTimeout: 30,
+		Rules: []httphook.Rule{{
+			Name: "new-http", Phase: httphook.RequestPhase, Mode: httphook.APIMode,
+			Source: fmt.Sprintf(`$httpClient.get({url: %q}, function(error) { $done({headers: Object.assign({}, $request.headers, {"X-Generation": ["new"]})}); });`, server.URL+"/new"),
+		}},
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = newHooks.Close() })
+	manager := NewManager(Config{
+		Enabled: true, ScriptHooks: oldHooks,
+		ScriptServices: services,
+	})
+	old, releaseOld := manager.acquireSnapshot()
+	var releaseOldOnce sync.Once
+	defer releaseOldOnce.Do(releaseOld)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.test/", nil)
+	require.NoError(t, err)
+	applyDone := make(chan error, 1)
+	go func() {
+		_, applyErr := old.config.ScriptHooks.ApplyRequest(ctx, request)
+		applyDone <- applyErr
+	}()
+	select {
+	case <-oldStarted:
+	case <-time.After(time.Second):
+		t.Fatal("retired-generation HTTP task did not reach the controlled server")
+	}
+	manager.Update(Config{Enabled: true, ScriptHooks: newHooks, ScriptServices: services})
+	current, releaseCurrent := manager.acquireSnapshot()
+	var releaseCurrentOnce sync.Once
+	defer releaseCurrentOnce.Do(releaseCurrent)
+	newRequest, err := http.NewRequest(http.MethodGet, "https://example.test/", nil)
+	require.NoError(t, err)
+	newApplyDone := make(chan struct {
+		result httphook.RequestResult
+		err    error
+	}, 1)
+	go func() {
+		result, applyErr := current.config.ScriptHooks.ApplyRequest(context.Background(), newRequest)
+		newApplyDone <- struct {
+			result httphook.RequestResult
+			err    error
+		}{result, applyErr}
+	}()
+	select {
+	case <-newStarted:
+	case <-time.After(time.Second):
+		t.Fatal("new-generation HTTP task did not start while the old generation was active")
+	}
+	select {
+	case completed := <-newApplyDone:
+		require.NoError(t, completed.err)
+		require.NotNil(t, completed.result.Headers)
+		require.Equal(t, "new", completed.result.Headers.Get("X-Generation"))
+	case <-time.After(time.Second):
+		t.Fatal("new-generation HTTP task did not complete")
+	}
+	require.True(t, current.config.ScriptHooks.RuntimeInitialized())
+	releaseCurrentOnce.Do(releaseCurrent)
+	for generation := 0; generation < 32; generation++ {
+		manager.Update(Config{Enabled: true})
+	}
+	require.False(t, current.config.ScriptHooks.RuntimeInitialized(), "the new generation closes after its last reference is retired")
+	require.EqualValues(t, 1, old.refs.Load(), "the pinned request keeps the retired generation alive")
+	require.True(t, old.config.ScriptHooks.RuntimeInitialized())
+	cancel()
+	select {
+	case err := <-applyDone:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("request context cancellation did not stop the old-generation script")
+	}
+	select {
+	case <-oldCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("canceled old-generation HTTP task did not close its server request")
+	}
+	releaseOldOnce.Do(releaseOld)
+	require.Zero(t, old.refs.Load())
+	require.False(t, old.config.ScriptHooks.RuntimeInitialized(), "the retired Runtime closes after its pinned request releases")
 }
 
 func TestM42RetiredSnapshotClosesRuntimeAfterPinnedUse(t *testing.T) {

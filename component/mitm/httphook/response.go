@@ -45,7 +45,13 @@ func (s *Snapshot) ApplyResponse(ctx context.Context, request *http.Request, res
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}
-	value, err := s.execute(ctx, rule, responseInput(request, response, body))
+	var value any
+	var err error
+	if rule.mode == APIMode {
+		value, err = s.executeAPI(ctx, rule, apiResponseGlobals(request, response, body))
+	} else {
+		value, err = s.execute(ctx, rule, responseInput(request, response, body))
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return result, ctx.Err()

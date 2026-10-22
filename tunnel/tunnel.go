@@ -108,6 +108,10 @@ func (t tunnel) DialTCPWithTLSHandshake(ctx context.Context, metadata *C.Metadat
 }
 
 func (t tunnel) dialMITMNativeTCP(ctx context.Context, metadata *C.Metadata, handshake mitm.NativeTLSHandshake) (net.Conn, error) {
+	return t.dialMITMNativeTCPWithPinnedIP(ctx, metadata, handshake, netip.Addr{})
+}
+
+func (t tunnel) dialMITMNativeTCPWithPinnedIP(ctx context.Context, metadata *C.Metadata, handshake mitm.NativeTLSHandshake, pinnedIP netip.Addr) (net.Conn, error) {
 	if metadata == nil || !metadata.Valid() {
 		return nil, errors.New("MITM outbound Metadata is invalid")
 	}
@@ -130,6 +134,15 @@ func (t tunnel) dialMITMNativeTCP(ctx context.Context, metadata *C.Metadata, han
 		return nil, errors.New("MITM outbound route selected no proxy")
 	}
 	dialMetadata := nativeDialMetadata(prepared)
+	if pinnedIP.IsValid() {
+		dialMetadata = dialMetadata.Clone()
+		dialMetadata.Host = ""
+		dialMetadata.DstIP = pinnedIP.Unmap()
+		dialMetadata.DNSMode = C.DNSNormal
+		dialMetadata.RawDstAddr = nil
+		dialMetadata.DstGeoIP = nil
+		dialMetadata.DstIPASN = ""
+	}
 	type dialResult struct {
 		remote  C.Conn
 		tracked C.Conn

@@ -76,3 +76,45 @@ func BenchmarkHTTPHookMatchedMutation(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkHTTPHookAPIMutation(b *testing.B) {
+	snapshot, err := Compile(Config{Enable: true, Rules: []Rule{{
+		Name: "api-mutate", Phase: RequestPhase, Mode: APIMode,
+		Source: `$done({headers: Object.assign({}, $request.headers, {"X-Hook": ["yes"]}), body: $request.body + "!"});`,
+	}}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer snapshot.Close()
+	request, _ := http.NewRequest(http.MethodPost, "https://example.test/match", strings.NewReader("small request body"))
+	_, _ = snapshot.ApplyRequest(context.Background(), request)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		request.Body = io.NopCloser(strings.NewReader("small request body"))
+		benchmarkHookResult, err = snapshot.ApplyRequest(context.Background(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHTTPHookAPIDonePassthrough(b *testing.B) {
+	snapshot, err := Compile(Config{Enable: true, Rules: []Rule{{
+		Name: "api-pass", Phase: RequestPhase, Mode: APIMode, Source: `$done();`,
+	}}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer snapshot.Close()
+	request, _ := http.NewRequest(http.MethodGet, "https://example.test/match", nil)
+	_, _ = snapshot.ApplyRequest(context.Background(), request)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		benchmarkHookResult, err = snapshot.ApplyRequest(context.Background(), request)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

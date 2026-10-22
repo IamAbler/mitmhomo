@@ -46,15 +46,16 @@ type CacheStats struct {
 // Runtime compiles content-addressed scripts and executes each invocation in
 // a fresh VM. Runtime is safe for concurrent use.
 type Runtime struct {
-	config    Config
-	permits   atomic.Int64
-	cache     programCache
-	runtimeID uint64
-	closed    atomic.Bool
-	closeOnce sync.Once
-	compileMu sync.Mutex
-	activeMu  sync.Mutex
-	activeVMs map[*goja.Runtime]struct{}
+	config         Config
+	permits        atomic.Int64
+	cache          programCache
+	runtimeID      uint64
+	closed         atomic.Bool
+	closeOnce      sync.Once
+	compileMu      sync.Mutex
+	activeMu       sync.Mutex
+	activeVMs      map[*goja.Runtime]struct{}
+	activeSessions map[*Session]struct{}
 }
 
 var nextRuntimeID atomic.Uint64
@@ -162,12 +163,20 @@ func (r *Runtime) Close() error {
 		r.closed.Store(true)
 		r.activeMu.Lock()
 		active := make([]*goja.Runtime, 0, len(r.activeVMs))
+		sessions := make([]*Session, 0, len(r.activeSessions))
 		for vm := range r.activeVMs {
 			active = append(active, vm)
 		}
+		for session := range r.activeSessions {
+			sessions = append(sessions, session)
+		}
 		r.activeVMs = nil
+		r.activeSessions = nil
 		r.activeMu.Unlock()
 		r.cache.clear()
+		for _, session := range sessions {
+			session.Close()
+		}
 		signal := &interruptSignal{kind: KindClosed, cause: ErrClosed}
 		for _, vm := range active {
 			interrupt(vm, signal)

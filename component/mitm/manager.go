@@ -46,6 +46,7 @@ type Config struct {
 	RequestHook        RequestHook
 	ResponseHook       ResponseHook
 	ScriptHooks        *httphook.Snapshot
+	ScriptServices     httphook.Services
 	// Rewrite is immutable after publication and fixed for each intercepted TLS
 	// connection. The HTTP adapter applies its request and response stages.
 	Rewrite *rewrite.Snapshot
@@ -95,7 +96,8 @@ func (m *Manager) Update(config Config) {
 			IdleTimeout:        config.IdleTimeout,
 			RequestHook:        config.RequestHook,
 			ResponseHook:       config.ResponseHook,
-			ScriptHooks:        cloneScriptHooks(config.Enabled, config.ScriptHooks),
+			ScriptHooks:        cloneScriptHooks(config.Enabled, config.ScriptHooks, config.ScriptServices),
+			ScriptServices:     config.ScriptServices,
 			Rewrite:            config.Rewrite,
 			upstreamRootCAs:    config.upstreamRootCAs,
 		},
@@ -128,11 +130,11 @@ func (m *Manager) Update(config Config) {
 	}
 }
 
-func cloneScriptHooks(enabled bool, hooks *httphook.Snapshot) *httphook.Snapshot {
+func cloneScriptHooks(enabled bool, hooks *httphook.Snapshot, services httphook.Services) *httphook.Snapshot {
 	if !enabled || hooks == nil {
 		return nil
 	}
-	return hooks.Clone()
+	return hooks.CloneWithServices(services)
 }
 
 func (s *configSnapshot) tryAcquire() bool {
@@ -203,6 +205,7 @@ func (m *Manager) ConfigSnapshot() Config {
 		RequestHook:        snapshot.config.RequestHook,
 		ResponseHook:       snapshot.config.ResponseHook,
 		ScriptHooks:        snapshot.config.ScriptHooks.Clone(),
+		ScriptServices:     snapshot.config.ScriptServices,
 		Rewrite:            snapshot.config.Rewrite,
 		upstreamRootCAs:    snapshot.config.upstreamRootCAs,
 	}
