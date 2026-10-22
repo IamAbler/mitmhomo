@@ -92,10 +92,12 @@ func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 func UpdateMITMManager(manager *mitm.Manager) {
 	mitmPublishMu.Lock()
 	old := mitmDispatcher.Swap(manager)
-	mitmPublishMu.Unlock()
+	cleanup := func() {}
 	if old != nil && old != manager {
-		_ = old.Close()
+		cleanup = old.RetireDeferred()
 	}
+	mitmPublishMu.Unlock()
+	cleanup()
 }
 
 // MITMGeneration exposes immutable lifecycle diagnostics for the current

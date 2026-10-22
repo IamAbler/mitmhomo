@@ -112,7 +112,9 @@ func (m *Manager) update(config Config, prepare bool) error {
 		return nil
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Defer unlock before running the elected retirement continuation.
+	cleanup := func() {}
+	defer func() { m.mu.Unlock(); cleanup() }()
 	if m.closed {
 		return generation.ErrUnavailable
 	}
@@ -191,7 +193,7 @@ func (m *Manager) update(config Config, prepare bool) error {
 	_ = snapshot.generation.Activate()
 	previous := m.snapshot.Swap(snapshot)
 	if previous != nil {
-		previous.retire()
+		cleanup = previous.retireDeferred()
 	}
 	return nil
 }
@@ -211,10 +213,16 @@ func (s *configSnapshot) release() {
 }
 
 func (s *configSnapshot) retire() {
+	s.retireDeferred()()
+}
+
+func (s *configSnapshot) retireDeferred() func() {
 	if s != nil && s.retired.CompareAndSwap(false, true) {
-		s.generation.Retire()
+		cleanup := s.generation.RetireDeferred()
 		s.release() // Manager ownership.
+		return cleanup
 	}
+	return func() {}
 }
 
 // ConfigSnapshot returns a detached configuration copy. If ScriptHooks is
@@ -308,26 +316,32 @@ func (m *Manager) Close() error {
 	if m == nil {
 		return nil
 	}
+	m.RetireDeferred()()
+	if g := m.Generation(); g != nil {
+		return g.CloseError()
+	}
+	return nil
+}
+
+// RetireDeferred revokes all Manager admission synchronously. Its returned
+// continuation must be invoked after releasing the Tunnel publication lock.
+func (m *Manager) RetireDeferred() func() {
+	if m == nil {
+		return func() {}
+	}
 	m.mu.Lock()
 	if m.closed {
-		g := m.retiredGeneration
 		m.mu.Unlock()
-		if g != nil {
-			return g.CloseError()
-		}
-		return nil
+		return func() {}
 	}
 	m.closed = true
 	snapshot := m.snapshot.Swap(nil)
 	if snapshot != nil {
 		m.retiredGeneration = snapshot.generation
 	}
+	cleanup := snapshot.retireDeferred()
 	m.mu.Unlock()
-	if snapshot != nil {
-		snapshot.retire()
-		return snapshot.generation.CloseError()
-	}
-	return nil
+	return cleanup
 }
 
 // Generation returns lifecycle diagnostics, never a connection admission path.

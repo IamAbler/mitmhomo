@@ -36,6 +36,7 @@ type Generation struct {
 	done                                  chan struct{}
 	err                                   error
 	observer                              func(error)
+	dispatchCleanup func(func())
 }
 
 func New(resources ...io.Closer) *Generation {
@@ -68,6 +69,13 @@ func (g *Generation) Activate() error {
 // Retire releases publisher ownership. Existing parents retain admission for
 // children, but independent connection admission is permanently revoked.
 func (g *Generation) Retire() {
+	g.RetireDeferred()()
+}
+
+// RetireDeferred revokes independent Bind immediately. The caller owns the
+// returned idempotent cleanup continuation and must run it outside publication
+// locks. A live lease may instead elect cleanup on its eventual release.
+func (g *Generation) RetireDeferred() func() {
 	g.mu.Lock()
 	if g.state == Building || g.state == Active {
 		g.state = Retiring
@@ -75,8 +83,10 @@ func (g *Generation) Retire() {
 	cleanup := g.cleanupLocked()
 	g.mu.Unlock()
 	if cleanup {
-		g.cleanup()
+		var once sync.Once
+		return func() { once.Do(g.runCleanup) }
 	}
+	return func() {}
 }
 func (g *Generation) Close() error          { g.Retire(); return g.CloseError() }
 func (g *Generation) CloseError() error     { g.mu.Lock(); defer g.mu.Unlock(); return g.err }
@@ -114,6 +124,10 @@ func (g *Generation) cleanup() {
 	if observer != nil {
 		observer(err)
 	}
+}
+
+func (g *Generation) runCleanup() {
+	if g.dispatchCleanup!=nil {g.dispatchCleanup(g.cleanup)} else {g.cleanup()}
 }
 
 // Lease is a capability. Child admission and parent Close share the same lock,
@@ -169,7 +183,7 @@ func (l *Lease) Close() error {
 	cleanup := g.cleanupLocked()
 	g.mu.Unlock()
 	if cleanup {
-		g.cleanup()
+		g.runCleanup()
 	}
 	return nil
 }
@@ -194,11 +208,13 @@ func (p *Publisher) Publish(g *Generation) error {
 	}
 	old := p.current
 	p.current = g
+	cleanup := func() {}
+	if old != nil {
+		cleanup = old.RetireDeferred()
+	}
 	// Retire outside the publisher lock: a blocking closer must not block Bind.
 	p.mu.Unlock()
-	if old != nil {
-		old.Retire()
-	}
+	cleanup()
 	return nil
 }
 func (p *Publisher) Bind() (*Lease, error) {
@@ -214,9 +230,14 @@ func (p *Publisher) Close() error {
 	old := p.current
 	p.current = nil
 	p.closed = true
+	cleanup := func() {}
+	if old != nil {
+		cleanup = old.RetireDeferred()
+	}
 	p.mu.Unlock()
 	if old != nil {
-		return old.Close()
+		cleanup()
+		return old.CloseError()
 	}
 	return nil
 }
