@@ -52,6 +52,7 @@ type bodyOperation struct {
 	ctx                      context.Context
 	err                      error
 	count                    int
+	setupError               error
 	canceled                 error
 	logicalClosed            bool
 	temporary                []io.Closer
@@ -114,7 +115,7 @@ func (b *BodyBroker) CancelRead(cause error) {
 	}
 }
 
-func (b *BodyBroker) run(ctx context.Context, accept bodyAcceptance, resources []io.Closer, synchronous bool, execute func(*bodyData) (int, error)) (int, error) {
+func (b *BodyBroker) run(ctx context.Context, accept bodyAcceptance, resources []io.Closer, execute func(*bodyData) (int, error)) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -183,19 +184,7 @@ func (b *BodyBroker) run(ctx context.Context, accept bodyAcceptance, resources [
 		acquire := b.acquireExecution
 		b.acquireExecution = nil // Exactly one lifetime pin for an adapter-owned source.
 		b.mu.Unlock()
-		var acquireErr error
-		if acquire != nil {
-			lease, err := acquire()
-			acquireErr = err
-			if lease == nil && err == nil {
-				acquireErr = ErrInvalid
-			}
-			if lease != nil {
-				b.mu.Lock()
-				b.held = append(b.held, lease)
-				b.mu.Unlock()
-			}
-		}
+		acquireErr := b.acquirePin(acquire)
 		task := func() {
 			var n int
 			err := acquireErr
@@ -206,10 +195,10 @@ func (b *BodyBroker) run(ctx context.Context, accept bodyAcceptance, resources [
 			}
 			b.finishOperation(op, accept, n, err)
 		}
-		// The only background launch in the model: a source already owns a global
+		// Buffered operation launch: a source already owns a global
 		// capacity ticket, and operation registration permits one worker per source.
-		// No queue, timeout watcher, or separate cleanup worker is created.
-		if synchronous || len(b.tickets) == 0 {
+		// No queue or auxiliary cancellation/cleanup worker is created for it.
+		if len(b.tickets) == 0 {
 			task()
 		} else {
 			go task()
@@ -300,7 +289,7 @@ func (b *BodyBroker) finishOperation(op *bodyOperation, accept bodyAcceptance, n
 				ticket.Release()
 			}
 			b.mu.Lock()
-			b.closeErr = errors.Join(b.closeErr, op.work.closeErr, cleanupErr)
+			b.closeErr = errors.Join(b.closeErr, op.work.closeErr, cleanupErr, op.setupError)
 		}
 		if b.closing {
 			b.state = Released
@@ -363,12 +352,15 @@ func (b *BodyBroker) CloseLogical() {
 	b.operation = op
 	b.last = op
 	b.bodyData = bodyData{ctx: b.ctx, ledger: b.ledger, state: Released, owner: op.work.owner, declared: op.work.declared}
+	acquire := b.acquireExecution
+	b.acquireExecution = nil
 	b.mu.Unlock()
+	op.setupError = b.acquirePin(acquire)
 	// The source's reserved owner also covers a blocked destructor.
 	b.dispatchBodyClose(op)
 }
 func (b *BodyBroker) dispatchBodyClose(op *bodyOperation) {
-	go func() { err := op.work.close(); b.finishOperation(op, nil, 0, err) }()
+	go func() { err := errors.Join(op.setupError, op.work.close()); b.finishOperation(op, nil, 0, err) }()
 }
 
 // Streaming Read borrows its caller's buffer, so cancellation can only ask an
@@ -414,3 +406,21 @@ func (b *BodyBroker) CloseContext(ctx context.Context) error {
 	}
 }
 func (b *BodyBroker) Close() error { return b.CloseContext(context.Background()) }
+
+// The adapter capability must only register an existing generation lease;
+// it must not initialize a backend or perform I/O. It runs outside state locks.
+func (b *BodyBroker) acquirePin(acquire func() (io.Closer, error)) error {
+	if acquire == nil {
+		return nil
+	}
+	lease, err := acquire()
+	if lease != nil {
+		b.mu.Lock()
+		b.held = append(b.held, lease)
+		b.mu.Unlock()
+	}
+	if lease == nil && err == nil {
+		return ErrInvalid
+	}
+	return err
+}

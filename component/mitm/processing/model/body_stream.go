@@ -49,19 +49,7 @@ func (b *BodyBroker) takeStream(ctx context.Context) (io.ReadCloser, error) {
 	// Reserve exclusive setup until a concurrent Close can elect stream drain.
 	op.reading = true
 	b.mu.Unlock()
-	var err error
-	if acquire != nil {
-		lease, acquireErr := acquire()
-		err = acquireErr
-		if lease == nil && err == nil {
-			err = ErrInvalid
-		}
-		if lease != nil {
-			b.mu.Lock()
-			b.held = append(b.held, lease)
-			b.mu.Unlock()
-		}
-	}
+	err := b.acquirePin(acquire)
 	b.mu.Lock()
 	closing := b.closing
 	if err == nil && !closing {

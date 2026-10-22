@@ -43,7 +43,8 @@ type BodySource struct {
 	Interrupt func()
 	// Executions optionally adds a smaller owner limit; the global limit still applies.
 	Executions *BodyExecutionPool
-	// AcquireExecution pins the existing generation before I/O starts.
+	// AcquireExecution must register an existing Generation lease without I/O.
+	// The pin covers Read and source disposal, including an unread Body's Close.
 	AcquireExecution func() (io.Closer, error)
 }
 type BodyInfo struct {
@@ -177,7 +178,7 @@ func (b *BodyBroker) prepare(ctx context.Context, need BodyNeed, limit int64, ac
 		return nil
 	}
 	b.mu.Unlock()
-	_, err := b.run(ctx, accept, resources, false, func(work *bodyData) (int, error) { return 0, work.prepare(ctx, need, limit) })
+	_, err := b.run(ctx, accept, resources, func(work *bodyData) (int, error) { return 0, work.prepare(ctx, need, limit) })
 	return err
 }
 
@@ -202,7 +203,7 @@ func (b *BodyBroker) replace(ctx context.Context, data []byte, accept bodyAccept
 		}
 		return accept(publish)
 	}
-	_, err = b.run(ctx, acceptReplacement, []io.Closer{bodyReservation{ticket}}, false, func(work *bodyData) (int, error) {
+	_, err = b.run(ctx, acceptReplacement, []io.Closer{bodyReservation{ticket}}, func(work *bodyData) (int, error) {
 		operationErr = work.replace(ctx, owned)
 		return 0, operationErr
 	})

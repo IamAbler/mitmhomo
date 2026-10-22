@@ -121,3 +121,54 @@ func TestBodyReadPinsRetiredGenerationUntilPhysicalDrain(t *testing.T) {
 	}
 	publisher.Close()
 }
+
+type unreadGenerationBody struct {
+	entered, release chan struct{}
+	closes           atomic.Int32
+}
+
+func (*unreadGenerationBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (r *unreadGenerationBody) Close() error {
+	r.closes.Add(1)
+	close(r.entered)
+	<-r.release
+	return nil
+}
+func TestUnreadBodyDisposalPinsGeneration(t *testing.T) {
+	resource := &closer{}
+	g := New(resource)
+	g.Activate()
+	connection, _ := g.Bind()
+	reader := &unreadGenerationBody{entered: make(chan struct{}), release: make(chan struct{})}
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(reader.release) }) }
+	defer unblock()
+	ledger, _ := model.NewLedger(-1, nil)
+	broker, err := model.NewBodyBroker(context.Background(), model.BodySource{Reader: reader, Owner: model.FrameworkOwned, DeclaredLength: -1, AcquireExecution: func() (io.Closer, error) { return connection.Execution() }}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.CloseLogical()
+	select {
+	case <-reader.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("disposal did not start")
+	}
+	g.Retire()
+	connection.Close()
+	if g.State() != Retiring || resource.n.Load() != 0 || reader.closes.Load() != 1 {
+		t.Fatal("unread source disposal lost its generation pin")
+	}
+	unblock()
+	wait, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err = broker.CloseContext(wait); err != nil {
+		t.Fatal(err)
+	}
+	if err = g.WaitClosed(wait); err != nil {
+		t.Fatal(err)
+	}
+	if resource.n.Load() != 1 || reader.closes.Load() != 1 {
+		t.Fatal("duplicate cleanup")
+	}
+}
