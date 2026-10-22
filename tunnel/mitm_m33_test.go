@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ import (
 
 // Real DIRECT and HTTP CONNECT adapters, native rule selection and Tracker,
 // verified TLS, and a real H2 origin. No substitute MITM native dialer.
-func TestM33NativeH2DirectProxyAndRouteChanges(t *testing.T) {
+func TestM34NativeH2DirectProxyAndRouteChanges(t *testing.T) {
 	oldMode, oldProxies, oldProviders := tunnel.Mode(), tunnel.Proxies(), tunnel.Providers()
 	oldRules, oldRuleProviders := tunnel.Rules(), tunnel.RuleProviders()
 	oldHosts := resolver.DefaultHosts
@@ -55,6 +56,7 @@ func TestM33NativeH2DirectProxyAndRouteChanges(t *testing.T) {
 	tunnel.SetMode(tunnel.Rule)
 	resolver.DefaultHosts = resolver.NewHosts(trie.New[resolver.HostValue]())
 	var upstreamCalls, connects atomic.Int32
+	var accepted atomic.Int32
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
 		require.Equal(t, 2, r.ProtoMajor)
@@ -65,6 +67,11 @@ func TestM33NativeH2DirectProxyAndRouteChanges(t *testing.T) {
 		fmt.Fprintf(w, "%s:%s", r.Method, b)
 	}))
 	upstream.EnableHTTP2 = true
+	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			accepted.Add(1)
+		}
+	}
 	upstream.StartTLS()
 	t.Cleanup(upstream.Close)
 	leaf := upstream.Certificate()
@@ -108,42 +115,87 @@ func TestM33NativeH2DirectProxyAndRouteChanges(t *testing.T) {
 	require.NoError(t, err)
 	authority, roots := loadM33TestCA(t)
 	manager := mitm.NewManager(mitm.Config{Enabled: true, Ports: []uint16{443}, Domains: []string{"localhost"}, CA: authority, Rewrite: pipeline, HandshakeTimeout: time.Second, RequestTimeout: 4 * time.Second, IdleTimeout: time.Second})
-	serverRaw, clientRaw := net.Pipe()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan m33DispatchResult, 1)
-	go func() {
-		outcome, err := manager.Dispatch(ctx, N.NewBufferedConn(serverRaw), &C.Metadata{NetWork: C.TCP, Type: C.TUNNEL, Host: "localhost", DstPort: 443, SrcIP: netip.MustParseAddr("192.0.2.33"), SrcPort: 43333}, nil, tunnel.Tunnel.DialTCPWithTLSHandshake)
-		done <- m33DispatchResult{outcome: outcome, err: err}
-	}()
-	secure := tls.Client(clientRaw, &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
-	require.NoError(t, secure.HandshakeContext(ctx))
-	cc, err := (&http2.Transport{}).NewClientConn(secure)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		defer cancel()
-		cc.Close()
-		select {
-		case result := <-done:
-			require.NoError(t, result.err)
-		case <-time.After(3 * time.Second):
-			t.Error("dispatcher leaked")
+
+	start := func() (*http2.ClientConn, func()) {
+		serverRaw, clientRaw := net.Pipe()
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan m33DispatchResult, 1)
+		go func() {
+			outcome, err := manager.Dispatch(ctx, N.NewBufferedConn(serverRaw), &C.Metadata{NetWork: C.TCP, Type: C.TUNNEL, Host: "localhost", DstPort: 443, SrcIP: netip.MustParseAddr("192.0.2.33"), SrcPort: 43333}, nil, tunnel.Tunnel.DialTCPWithTLSHandshake)
+			done <- m33DispatchResult{outcome: outcome, err: err}
+		}()
+		secure := tls.Client(clientRaw, &tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+		require.NoError(t, secure.HandshakeContext(ctx))
+		cc, err := (&http2.Transport{}).NewClientConn(secure)
+		require.NoError(t, err)
+		var once sync.Once
+		closeConn := func() {
+			once.Do(func() {
+				defer cancel()
+				cc.Close()
+				select {
+				case result := <-done:
+					require.NoError(t, result.err)
+				case <-time.After(3 * time.Second):
+					t.Error("dispatcher leaked")
+				}
+			})
 		}
-	})
+		t.Cleanup(closeConn)
+		return cc, closeConn
+	}
+	send := func(cc *http2.ClientConn, n int) {
+		results := make(chan error, n)
+		for j := 0; j < n; j++ {
+			go func() {
+				req, _ := http.NewRequest("POST", "https://localhost/old", strings.NewReader("payload"))
+				res, e := cc.RoundTrip(req)
+				if e == nil {
+					var b []byte
+					b, e = io.ReadAll(res.Body)
+					res.Body.Close()
+					if e == nil && (res.StatusCode != 200 || string(b) != "POST:payload") {
+						e = fmt.Errorf("invalid native response")
+					}
+				}
+				results <- e
+			}()
+		}
+		for j := 0; j < n; j++ {
+			require.NoError(t, <-results)
+		}
+	}
+	// Existing DIRECT survives a PROXY rule reload; existing PROXY survives
+	// DIRECT reload. A later downstream connection observes the current rule.
+	expectedConnects := int32(0)
 	for i, route := range []string{"DIRECT", "M33_PROXY", "DIRECT"} {
-		// No active requests while mutating these native globals; pool bypass is
-		// tested on the SAME downstream connection and SAME rewritten origin.
 		tunnel.UpdateRules([]C.Rule{m33RouteRule{adapter: route}}, nil, nil)
-		cfg := manager.ConfigSnapshot()
-		manager.Update(cfg)
-		req, err := http.NewRequest("POST", "https://localhost/old", io.NopCloser(strings.NewReader("payload")))
-		require.NoError(t, err)
-		response, err := cc.RoundTrip(req)
-		require.NoError(t, err)
-		require.Equal(t, 200, response.StatusCode)
-		body, err := io.ReadAll(response.Body)
-		require.NoError(t, err)
-		require.NoError(t, response.Body.Close())
-		require.Equal(t, "POST:payload", string(body))
+		cc, closeConn := start()
+		send(cc, 10)
+		if route == "M33_PROXY" {
+			expectedConnects++
+		}
+		require.Equal(t, expectedConnects, connects.Load())
+		other := "M33_PROXY"
+		if route == "M33_PROXY" {
+			other = "DIRECT"
+		}
+		tunnel.UpdateRules([]C.Rule{m33RouteRule{adapter: other}}, nil, nil)
+		manager.Update(manager.ConfigSnapshot())
+		send(cc, 10)
+		require.Equal(t, expectedConnects, connects.Load(), "established socket keeps native route and chain")
+		require.EqualValues(t, i+1, accepted.Load(), "twenty native streams per upstream TCP connection")
+		var chains []C.Chain
+		statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+			if tracker.Info().Metadata.SrcPort == 43333 {
+				chains = append(chains, tracker.Info().Chain)
+			}
+			return true
+		})
+		require.Len(t, chains, 1)
+		require.Contains(t, chains[0], route)
+		require.EqualValues(t, (i+1)*20, upstreamCalls.Load())
+		closeConn()
 		require.Eventually(t, func() bool {
 			found := false
 			statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
@@ -152,9 +204,27 @@ func TestM33NativeH2DirectProxyAndRouteChanges(t *testing.T) {
 			})
 			return !found
 		}, 3*time.Second, 5*time.Millisecond)
-		require.EqualValues(t, i+1, upstreamCalls.Load())
 	}
-	require.EqualValues(t, 1, connects.Load(), "only the PROXY request may use the CONNECT relay")
+	require.EqualValues(t, 1, connects.Load(), "one CONNECT for twenty PROXY streams")
+	// A failed upstream on the SAME downstream connection is replaced through
+	// current native rules, instead of retaining a dead route or replaying HTTP.
+	tunnel.UpdateRules([]C.Rule{m33RouteRule{adapter: "DIRECT"}}, nil, nil)
+	cc, closeConn := start()
+	send(cc, 2)
+	tunnel.UpdateRules([]C.Rule{m33RouteRule{adapter: "M33_PROXY"}}, nil, nil)
+	upstream.CloseClientConnections()
+	require.Eventually(t, func() bool {
+		found := false
+		statistic.DefaultManager.Range(func(tracker statistic.Tracker) bool {
+			found = found || tracker.Info().Metadata.SrcPort == 43333
+			return !found
+		})
+		return !found
+	}, 3*time.Second, 5*time.Millisecond)
+	send(cc, 2)
+	require.EqualValues(t, 2, connects.Load(), "replacement uses reloaded PROXY rule")
+	require.EqualValues(t, 5, accepted.Load())
+	closeConn()
 }
 
 func loadM33TestCA(t *testing.T) (*mitm.CertificateAuthority, *x509.CertPool) {

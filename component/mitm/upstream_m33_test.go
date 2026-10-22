@@ -59,7 +59,11 @@ func TestM33ProtocolMatrix(t *testing.T) {
 					require.Equal(t, method+":payload", string(body))
 					require.Equal(t, "complete", res.Trailer.Get("X-Download"))
 				}
-				require.EqualValues(t, 2, h.dials.Load(), "each request must select a fresh native route")
+				wantDials := 2
+				if downH2 && want == 2 {
+					wantDials = 1
+				}
+				require.EqualValues(t, wantDials, h.dials.Load(), "only downstream H2/upstream H2 shares its native route lease")
 			})
 		}
 	}
@@ -139,7 +143,7 @@ func TestM33ConcurrentCancellationIsolation(t *testing.T) {
 	res := h2Request(t, h, "GET", "/after", "")
 	io.Copy(io.Discard, res.Body)
 	res.Body.Close()
-	require.EqualValues(t, 3, h.dials.Load())
+	require.EqualValues(t, 1, h.dials.Load(), "cancel must preserve the shared upstream socket")
 }
 
 func TestM33RewriteAcrossProtocols(t *testing.T) {

@@ -22,13 +22,14 @@ import (
 )
 
 type h2Harness struct {
-	client  *http2.ClientConn
-	wire    http.RoundTripper
-	manager *Manager
-	streams atomic.Int32
-	dials   atomic.Int32
-	active  atomic.Int32
-	done    chan dispatchResult
+	client   *http2.ClientConn
+	wire     http.RoundTripper
+	manager  *Manager
+	streams  atomic.Int32
+	dials    atomic.Int32
+	active   atomic.Int32
+	accepted atomic.Int32
+	done     chan dispatchResult
 }
 
 // Both sides use real TCP + verified TLS. The client uses one explicit
@@ -53,6 +54,7 @@ func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targe
 	upstream.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: protocols}
 	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		if state == http.StateNew {
+			h.accepted.Add(1)
 			h.active.Add(1)
 		}
 		if state == http.StateClosed {
@@ -83,6 +85,13 @@ func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targe
 	if manager != nil {
 		h.manager = manager
 		clientRoots.AddCert(manager.ConfigSnapshot().CA.leaf)
+		if trust {
+			// Each fixture has its own real TLS origin. Publish its roots only
+			// for the new downstream snapshot, retaining the old snapshot roots.
+			next := manager.ConfigSnapshot()
+			next.upstreamRootCAs = roots
+			manager.Update(next)
+		}
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

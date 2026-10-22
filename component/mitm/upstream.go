@@ -13,14 +13,10 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// roundTripProtocol selects the wire protocol only after native routing and a
-// verified TLS handshake. No Transport is allowed to dial outside native routing.
-// Each request owns its connection; a future shared pool requires a native route
-// lease, including dynamic proxy selection and policy invalidation semantics.
-func (rt *nativeRoundTripper) roundTripProtocol(req *http.Request) (*http.Response, error) {
+func (rt *nativeRoundTripper) dialTLS(ctx context.Context, serverName string) (*tls.Conn, error) {
 	cfg := rt.tlsConfig.Clone()
-	cfg.ServerName = req.URL.Hostname()
-	handshakeCtx, cancel := context.WithTimeout(req.Context(), rt.handshakeTimeout)
+	cfg.ServerName = serverName
+	handshakeCtx, cancel := context.WithTimeout(ctx, rt.handshakeTimeout)
 	conn, err := rt.dial(handshakeCtx, rt.target.Clone(), func(ctx context.Context, raw net.Conn) (net.Conn, error) {
 		secure := tls.Client(raw, cfg.Clone())
 		if err := secure.HandshakeContext(ctx); err != nil {
@@ -45,6 +41,50 @@ func (rt *nativeRoundTripper) roundTripProtocol(req *http.Request) (*http.Respon
 		_ = conn.Close()
 		return nil, errors.New("native TLS dial returned an unverified connection type")
 	}
+	return secure, nil
+}
+
+func (rt *nativeRoundTripper) h2Transport() *http2.Transport {
+	return &http2.Transport{
+		// With StrictMaxConcurrentStreams ClientConn queues at the peer limit.
+		// Do not combine this with ReserveNewRequest: x/net v0.35 counts
+		// reservations in that limit while holding reqHeaderMu, so a burst of
+		// reservations can prevent the first queued request from advancing.
+		StrictMaxConcurrentStreams: true,
+		IdleConnTimeout:            rt.idleTimeout,
+		ReadIdleTimeout:            rt.idleTimeout,
+		PingTimeout:                rt.handshakeTimeout,
+		WriteByteTimeout:           rt.requestTimeout,
+		MaxHeaderListSize:          1 << 20,
+	}
+}
+
+// Protocol selection follows Native routing and verified TLS. Shared H2
+// sockets belong to the downstream manager, never to an individual stream.
+func (rt *nativeRoundTripper) roundTripProtocol(req *http.Request) (*http.Response, error) {
+	var secure *tls.Conn
+	var err error
+	if rt.pool != nil {
+		var cc *http2.ClientConn
+		cc, secure, err = rt.pool.acquire(req, rt)
+		if err != nil {
+			return nil, err
+		}
+		if cc != nil {
+			// Direct ClientConn call: no automatic replay, including POST.
+			response, err := cc.RoundTrip(req)
+			if err == nil {
+				normalizeUpstreamTrailers(response)
+			}
+			return response, err
+		}
+	} else {
+		secure, err = rt.dialTLS(req.Context(), req.URL.Hostname())
+		if err != nil {
+			return nil, err
+		}
+	}
+	conn := secure
 	// This context is the exact request context, never Transport's detached dial
 	// context. It remains armed throughout streaming of the response body.
 	var once sync.Once
@@ -55,13 +95,7 @@ func (rt *nativeRoundTripper) roundTripProtocol(req *http.Request) (*http.Respon
 	var response *http.Response
 	switch protocol := secure.ConnectionState().NegotiatedProtocol; protocol {
 	case "h2":
-		transport := &http2.Transport{
-			IdleConnTimeout:   rt.idleTimeout,
-			ReadIdleTimeout:   rt.idleTimeout,
-			PingTimeout:       rt.handshakeTimeout,
-			WriteByteTimeout:  rt.requestTimeout,
-			MaxHeaderListSize: 1 << 20,
-		}
+		transport := rt.h2Transport()
 		var cc *http2.ClientConn
 		cc, err = transport.NewClientConn(secure)
 		if err == nil {
@@ -97,12 +131,16 @@ func (rt *nativeRoundTripper) roundTripProtocol(req *http.Request) (*http.Respon
 	}
 	// H2 can carry Content-Length together with trailing HEADERS. H1 must
 	// use chunked framing to carry those trailers, even without Rewrite.
+	normalizeUpstreamTrailers(response)
+	response.Body = &upstreamResponseBody{ReadCloser: response.Body, finish: finish}
+	return response, nil
+}
+
+func normalizeUpstreamTrailers(response *http.Response) {
 	if response.ProtoMajor == 2 && len(response.Trailer) > 0 {
 		response.Header.Del("Content-Length")
 		response.ContentLength = -1
 	}
-	response.Body = &upstreamResponseBody{ReadCloser: response.Body, finish: finish}
-	return response, nil
 }
 
 // Response body closure owns the request's connection, including when Rewrite

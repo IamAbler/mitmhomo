@@ -76,6 +76,17 @@ func GetCertPool() *x509.CertPool {
 	return globalCertPool
 }
 
+// GetCertPoolSnapshot freezes trust roots while holding the same lock used by
+// certificate updates. Callers can retain it across configuration reloads.
+func GetCertPoolSnapshot() *x509.CertPool {
+	mutex.Lock()
+	defer mutex.Unlock()
+	if globalCertPool == nil {
+		initializeCertPool()
+	}
+	return globalCertPool.Clone()
+}
+
 type Option struct {
 	TLSConfig      *tls.Config
 	Fingerprint    string

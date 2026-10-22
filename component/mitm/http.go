@@ -146,9 +146,16 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	handshakeTimeout = positiveDuration(snapshot.config.HandshakeTimeout, 10*time.Second)
 	upstreamRoots := snapshot.config.upstreamRootCAs
 	if upstreamRoots == nil {
-		upstreamRoots = ca.GetCertPool()
+		upstreamRoots = ca.GetCertPoolSnapshot()
+	} else {
+		upstreamRoots = upstreamRoots.Clone()
 	}
 	upstreamTLSConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: upstreamRoots, NextProtos: []string{"h2", "http/1.1"}}
+	var upstreamPool *upstreamManager
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		upstreamPool = newUpstreamManager(ctx, idleTimeout)
+		defer upstreamPool.Close()
+	}
 	originHost := normalizeDomain(metadata.Host)
 	if originHost == "" {
 		originHost = normalizeDomain(hello.ServerName)
@@ -246,6 +253,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		}
 		proxy := &httputil.ReverseProxy{
 			Transport: &nativeRoundTripper{
+				pool:             upstreamPool,
 				inboundTrailers:  inboundTrailers,
 				target:           targetMetadata,
 				dial:             dial,
@@ -957,9 +965,10 @@ func (listener *singleConnListener) Close() error {
 	return nil
 }
 
-// nativeRoundTripper owns one request and its native route. Connections are
-// never shared across requests: the native dialer re-evaluates policy each time.
+// Each request owns its transport facade. A downstream H2 connection can
+// supply a manager whose established sockets keep their native route lease.
 type nativeRoundTripper struct {
+	pool             *upstreamManager
 	inboundTrailers  http.Header
 	target           *C.Metadata
 	dial             NativeDialContext
