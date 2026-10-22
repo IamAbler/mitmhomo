@@ -110,6 +110,19 @@ func MITMGeneration() *generation.Generation {
 	return manager.Generation()
 }
 
+func bindMITMConnection(port uint16) *mitm.Connection {
+	if mitmDispatcher.Load() == nil {
+		return nil
+	}
+	mitmPublishMu.Lock()
+	defer mitmPublishMu.Unlock()
+	manager := mitmDispatcher.Load()
+	if manager == nil {
+		return nil
+	}
+	return manager.Bind(port)
+}
+
 // DialTCP reuses Mihomo's native metadata preprocessing, rule selection,
 // retry, proxy dialing, and statistics path for one MITM HTTP request.
 func (t tunnel) DialTCP(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
@@ -726,13 +739,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
-	mitmPublishMu.Lock()
-	manager := mitmDispatcher.Load()
-	var binding *mitm.Connection
-	if manager != nil {
-		binding = manager.Bind(metadata.DstPort)
-	}
-	mitmPublishMu.Unlock()
+	binding := bindMITMConnection(metadata.DstPort)
 	defer binding.Close()
 	mitmShouldInspect := binding != nil
 	var mitmCheckMetadata *C.Metadata

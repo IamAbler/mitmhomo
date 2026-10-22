@@ -72,7 +72,6 @@ type configSnapshot struct {
 	wildcardHost []string
 	refs         atomic.Int64
 	retired      atomic.Bool
-	closeOnce    sync.Once
 }
 
 // Manager publishes immutable configuration snapshots. A nil or disabled
@@ -92,8 +91,8 @@ func NewManager(config Config) *Manager {
 
 // BuildManager validates a production candidate before any configuration is
 // applied. NewManager remains available for parser and protocol fixtures that
-// deliberately exercise an absent CA. All fallible parsing/compilation occurs
-// in config.Parse before this constructor; Snapshot cloning is infallible.
+// deliberately exercise an absent CA. Parsing precedes this constructor;
+// processor initialization and script preparation finish before activation.
 func BuildManager(config Config) (*Manager, error) {
 	if config.Enabled && (config.CA == nil || config.CA.signer == nil || config.CA.leaf == nil) {
 		return nil, errors.New("MITM candidate requires a validated CA")
@@ -206,9 +205,7 @@ func (s *configSnapshot) release() {
 	if s == nil {
 		return
 	}
-	if s.refs.Add(-1) == 0 {
-		s.closeOnce.Do(func() {})
-	}
+	s.refs.Add(-1) // Legacy diagnostics only; Generation owns resource cleanup.
 }
 
 func (s *configSnapshot) retire() {
@@ -311,7 +308,11 @@ func (m *Manager) Close() error {
 	}
 	m.mu.Lock()
 	if m.closed {
+		g := m.retiredGeneration
 		m.mu.Unlock()
+		if g != nil {
+			return g.CloseError()
+		}
 		return nil
 	}
 	m.closed = true

@@ -2,7 +2,12 @@ package mitm
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
+	N "github.com/metacubex/mihomo/common/net"
+	C "github.com/metacubex/mihomo/constant"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -52,4 +57,36 @@ func TestM48ConnectionBindAndClose(t *testing.T) {
 	c.Close()
 	require.Equal(t, generation.Closed, old.State())
 	m.Close()
+}
+
+func TestM48HandshakeFailureReleasesGeneration(t *testing.T) {
+	authority, _ := makeTestAuthority(t)
+	m := NewManager(Config{Enabled: true, Ports: []uint16{443}, Domains: []string{"localhost"}, CA: authority, HandshakeTimeout: time.Second})
+	g := m.Generation()
+	binding := m.Bind(443)
+	require.NotNil(t, binding)
+	server, client := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, e := binding.Dispatch(ctx, N.NewBufferedConn(server), &C.Metadata{NetWork: C.TCP, Type: C.TUNNEL, Host: "localhost", DstPort: 443}, nil, func(context.Context, *C.Metadata, NativeTLSHandshake) (net.Conn, error) {
+			return nil, fmt.Errorf("unexpected dial")
+		})
+		done <- e
+	}()
+	secure := tls.Client(client, &tls.Config{ServerName: "localhost", MinVersion: tls.VersionTLS12})
+	require.Error(t, secure.HandshakeContext(ctx))
+	client.Close()
+	m.Close()
+	select {
+	case e := <-done:
+		require.Error(t, e)
+	case <-ctx.Done():
+		t.Fatal("dispatcher retained")
+	}
+	require.NoError(t, g.WaitClosed(ctx))
+	require.Equal(t, generation.Closed, g.State())
 }

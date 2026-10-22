@@ -1,11 +1,12 @@
 package hub
 
 import (
+	"sync"
+
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/log"
-	"sync"
 )
 
 var applyMu sync.Mutex
