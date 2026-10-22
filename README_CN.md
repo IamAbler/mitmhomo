@@ -10,25 +10,21 @@
 
 ## 项目概述
 
-`mitmhomo` 是基于 Mihomo Alpha 的独立下游 Fork，由项目维护者单独维护。项目新增原生 HTTPS MITM，并计划逐步加入 HTTP Rewrite 和可扩展脚本处理能力。mitmhomo 独立于 MetaCubeX 维护，不代表 MetaCubeX 官方项目。
+mitmhomo 是 Mihomo 的一个分支项目，专注于原生 HTTPS MITM 和可编程 HTTP 请求/响应处理。
+
+MITM 与脚本功能仍处于实验性开发阶段。
 
 ## 功能特性
 
 ### 继承自 Mihomo 的能力
 
-- HTTP、HTTPS、SOCKS 代理入站，以及 VMess、VLESS、Shadowsocks、Trojan、Snell、TUIC、Hysteria 等出站协议。
-- 内置 DNS 支持 DoH/DoT 上游和 Fake IP；路由规则支持域名、GEOIP、IP-CIDR 和进程匹配。
-- 代理组支持自动回退、负载均衡和延迟选择；另有远程代理提供者、Linux netfilter TCP 重定向及 Mihomo HTTP REST API 控制器。
-
-更多信息见 [Mihomo 功能介绍](https://github.com/MetaCubeX/mihomo/blob/Alpha/README.md#features)、[Mihomo 文档](https://wiki.metacubex.one/)、[Mihomo 参考配置](https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml)和兼容的 [MetaCubeXD Dashboard](https://github.com/MetaCubeX/metacubexd)。
+mitmhomo 保留 Mihomo 的代理和路由能力。更多信息见 [Mihomo 功能介绍](https://github.com/MetaCubeX/mihomo/blob/Alpha/README.md#features)、[Mihomo 文档](https://wiki.metacubex.one/)、[Mihomo 参考配置](https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml)和兼容的 [MetaCubeXD Dashboard](https://github.com/MetaCubeX/metacubexd)。
 
 ### mitmhomo 新增能力
 
-- **M1 原生 HTTPS MITM，支持 HTTP/1.1。** 默认关闭，只对配置的目标域名和 TCP 端口进行拦截。域名匹配依据 TLS Server Name（SNI）；请求通过 Mihomo 原生规则和所选出站转发。
-- 加载用户提供的 CA 证书和私钥，并按需生成站点证书。
-- 配置重载时为新连接更新 MITM 配置，并管理已接管连接的超时和关闭生命周期。
-
-HTTP Rewrite、重定向、本地响应和 JavaScript Hook 已列入规划，但 M1 尚未实现。
+- 原生 HTTPS MITM，支持 HTTP/1.1 和 HTTP/2；按配置的域名和端口接管流量，并通过 Mihomo 路由。
+- HTTP 请求/响应改写和合成响应。
+- 用于处理 HTTP 请求/响应的实验性 JavaScript 脚本功能。
 
 ## 快速开始
 
@@ -98,28 +94,14 @@ mitm:
 
 CA 证书和私钥必须是有效的匹配密钥对；客户端也必须主动信任该 CA，才能接受动态生成的站点证书。mitmhomo 负责加载 CA，不会替用户创建 CA。不得将 CA 私钥提交到 Git 仓库，不得关闭 TLS 证书验证。仅对你有权管理或已获授权的流量启用拦截。
 
-## 开发路线图
-
-以下为规划顺序，未来实施顺序可能调整。
-
-- [x] M1 — 原生 HTTPS MITM / HTTP/1.1
-- [ ] M2 — HTTP 请求 / 响应 Rewrite、重定向、本地响应
-- [ ] M3 — HTTP/2 MITM
-- [ ] M4 — JavaScript Runtime 与 HTTP Hook
-- [ ] M5 — HTTP/3 / QUIC MITM
-
 ## 已知限制
 
-- M1 仅支持 HTTP/1.1；暂不支持 HTTP/2 和 HTTP/3 MITM。
-- 尚未实现 HTTP Rewrite、重定向、本地响应和 JavaScript 处理。
-- `go.mod` 声明 Go 1.20，但尚未验证 Go 1.20 工具链兼容性。M1 测试记录未注明实际通过测试的 Go 版本，因此本文档不声明已验证版本。
-- 未执行外部 V2Ray 互操作测试。
-- 尚未验证真实 VLESS/VMess Early-data 互操作。
-- 缺少可用 SNI 或使用 ECH 的 ClientHello 不会被拦截。已接管连接中的 HTTP CONNECT 请求和协议升级暂不支持。
+- MITM 仅处理配置的域名和端口，且 TLS ClientHello 需要包含可用的服务器名称。
+- 已接管连接中的 HTTP CONNECT 请求和协议升级暂不支持。
 
 ## 从源码构建
 
-源码仓库地址为 `https://github.com/IamAbler/mitmhomo.git`。克隆后 Go 模块位于仓库根目录，本地工作区中的 `core/` 不是仓库子目录。
+克隆源码仓库，并在仓库根目录构建：
 
 ```sh
 git clone https://github.com/IamAbler/mitmhomo.git
@@ -133,7 +115,7 @@ go build -o mitmhomo .
 go build -tags with_gvisor -o mitmhomo-gvisor .
 ```
 
-`go.mod` 声明 Go 1.20。该声明不等于此 Fork 已验证的最低版本；特别是 Go 1.20 工具链兼容性尚未验证。仓库没有记录 M1 测试通过时所用的确切 Go 版本。
+`go.mod` 声明 Go 1.20；Go 1.20 工具链兼容性尚未验证。
 
 ## 上游与致谢
 

@@ -10,25 +10,21 @@
 
 ## Project Overview
 
-`mitmhomo` is an independently maintained downstream fork based on Mihomo Alpha. It adds native HTTPS MITM and is intended to grow HTTP rewrite and extensible script processing capabilities. The project is maintained separately and does not represent the official MetaCubeX project.
+mitmhomo is a fork of Mihomo focused on native HTTPS MITM and programmable HTTP request/response processing.
+
+MITM and scripting capabilities are experimental and under active development.
 
 ## Features
 
 ### Inherited from Mihomo
 
-- HTTP, HTTPS, and SOCKS proxy listeners, with outbound support for protocols including VMess, VLESS, Shadowsocks, Trojan, Snell, TUIC, and Hysteria.
-- Built-in DNS with DoH/DoT upstreams and fake IP, plus routing rules based on domains, GEOIP, IP-CIDR, or process.
-- Proxy groups with fallback, load balancing, and latency-based selection; remote providers; Linux netfilter TCP redirection; and Mihomo's HTTP REST API controller.
-
-See the [Mihomo feature overview](https://github.com/MetaCubeX/mihomo/blob/Alpha/README.md#features), [Mihomo documentation](https://wiki.metacubex.one/), the [Mihomo reference configuration](https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml), and the compatible [MetaCubeXD dashboard](https://github.com/MetaCubeX/metacubexd).
+mitmhomo retains Mihomo's proxy and routing capabilities. See the [Mihomo feature overview](https://github.com/MetaCubeX/mihomo/blob/Alpha/README.md#features), [Mihomo documentation](https://wiki.metacubex.one/), the [Mihomo reference configuration](https://github.com/MetaCubeX/mihomo/blob/Alpha/docs/config.yaml), and the compatible [MetaCubeXD dashboard](https://github.com/MetaCubeX/metacubexd).
 
 ### Added by mitmhomo
 
-- **M1 native HTTPS MITM for HTTP/1.1.** Interception is opt-in and limited by configured target domains and TCP ports. Matching uses the TLS server name (SNI); the request is forwarded using Mihomo's native rules and selected outbound.
-- Loads a user-provided CA certificate and private key, then creates per-site certificates when needed.
-- Applies updated MITM configuration to new connections on configuration reload and manages intercepted connection timeouts and closure.
-
-HTTP rewrite, redirects, local responses, and JavaScript hooks are planned; they are not implemented in M1.
+- Native HTTPS MITM for HTTP/1.1 and HTTP/2, limited to configured domains and ports and routed through Mihomo.
+- HTTP request/response rewriting and synthetic responses.
+- Experimental JavaScript scripting for HTTP request/response processing.
 
 ## Quick Start
 
@@ -98,28 +94,14 @@ mitm:
 
 The CA certificate and private key must be a valid matching pair, and the CA must be trusted by each client that should accept the generated site certificates. mitmhomo loads the CA; it does not create the CA for you. Never commit the CA private key. Do not disable TLS certificate verification. Enable interception only for traffic you own or are authorized to manage.
 
-## Development Roadmap
-
-The sequence below is a planning order and may change.
-
-- [x] M1 — Native HTTPS MITM / HTTP/1.1
-- [ ] M2 — HTTP Request / Response Rewrite, Redirect, Local Response
-- [ ] M3 — HTTP/2 MITM
-- [ ] M4 — JavaScript Runtime & HTTP Hooks
-- [ ] M5 — HTTP/3 / QUIC MITM
-
 ## Known Limitations
 
-- M1 supports HTTP/1.1 only. HTTP/2 and HTTP/3 MITM are not supported.
-- HTTP rewrite, redirect, local response, and JavaScript processing are not implemented.
-- `go.mod` declares Go 1.20, but compatibility with the Go 1.20 toolchain has not been verified. The M1 test record does not document a specific passing Go version, so this README does not claim one.
-- External V2Ray interoperability tests have not been run.
-- Real VLESS/VMess Early-data interoperability has not been verified.
-- ClientHello traffic without a usable SNI or using ECH is not intercepted. HTTP CONNECT requests and protocol upgrades within an intercepted connection are unsupported.
+- MITM only applies to configured domains and ports when a usable TLS server name is available.
+- HTTP CONNECT requests and protocol upgrades inside an intercepted connection are unsupported.
 
 ## Building from Source
 
-The source repository is `https://github.com/IamAbler/mitmhomo.git`. After cloning, the Go module is at the repository root; there is no local `core/` subdirectory.
+Clone the source repository and build from its root directory:
 
 ```sh
 git clone https://github.com/IamAbler/mitmhomo.git
@@ -133,7 +115,7 @@ go build -o mitmhomo .
 go build -tags with_gvisor -o mitmhomo-gvisor .
 ```
 
-`go.mod` declares Go 1.20. This declaration is not a verified minimum for this fork; in particular, Go 1.20 toolchain compatibility remains unverified. The repository does not record an exact Go version that passed the M1 test run.
+`go.mod` declares Go 1.20; compatibility with the Go 1.20 toolchain has not been verified.
 
 ## Upstream & Credits
 
