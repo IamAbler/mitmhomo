@@ -128,6 +128,28 @@ func (t *Transaction) TakeSynthetic() (SyntheticResponse, bool) {
 	return response, true
 }
 
+// DecisionCopy returns budgeted copies of the policy code or abort reason for
+// the terminal exchange outcome. The caller owns and must close to; reads
+// remain available after Terminate and stop after Transaction.Close.
+func (t *Transaction) DecisionCopy(to *CopyLease) (ExchangeOutcome, string, string, error) {
+	if t == nil || to == nil {
+		return ExchangePending, "", "", ErrInvalid
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.state == Closed {
+		return t.outcome, "", "", ErrClosed
+	}
+	var code, reason string
+	var err error
+	if t.outcome == ExchangeRejected {
+		code, err = cloneResultString(to, t.decisionCode)
+	} else if t.outcome == ExchangeAborted {
+		reason, err = cloneResultString(to, t.decisionReason)
+	}
+	return t.outcome, code, reason, err
+}
+
 // Commit applies one DoneResult only when its detached Input still identifies
 // the current Transaction revision. Identity checks, result validation,
 // candidate preparation, optional Body replacement, and the final state swap

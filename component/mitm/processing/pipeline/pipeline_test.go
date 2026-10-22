@@ -18,6 +18,7 @@ type fakeProcessor struct {
 	descriptor processor.Descriptor
 	lifecycle  *processor.Lifecycle
 	onStart    func(*processor.Invocation, *processor.Completion, model.Input)
+	mutateKey  func(model.InvocationKey) model.InvocationKey
 	startErr   error
 	starts     atomic.Int64
 }
@@ -40,7 +41,11 @@ func (p *fakeProcessor) Start(ctx context.Context, input model.Input, resources 
 	if p.startErr != nil {
 		return nil, p.startErr
 	}
-	invocation, completion, err := p.lifecycle.BeginWithResources(ctx, input.Key(), resources...)
+	key := input.Key()
+	if p.mutateKey != nil {
+		key = p.mutateKey(key)
+	}
+	invocation, completion, err := p.lifecycle.BeginWithResources(ctx, key, resources...)
 	if err != nil {
 		return nil, err
 	}
@@ -345,6 +350,15 @@ func TestRunnerControlResults(t *testing.T) {
 			if err != nil || report.Outcome != test.outcome || report.Stopped != test.stopped || tx.Outcome() != test.kind {
 				t.Fatalf("control result mismatch: report=%+v tx=%d err=%v", report, tx.Outcome(), err)
 			}
+			if test.kind == model.ExchangeRejected || test.kind == model.ExchangeAborted {
+				decisionLease := model.NewCopyLease(ledger)
+				outcome, code, reason, decisionErr := tx.DecisionCopy(decisionLease)
+				if decisionErr != nil || outcome != test.kind || test.kind == model.ExchangeRejected && code != "policy" || test.kind == model.ExchangeAborted && reason != "protocol" {
+					_ = decisionLease.Close()
+					t.Fatalf("terminal decision payload unavailable: outcome=%d code=%q reason=%q err=%v", outcome, code, reason, decisionErr)
+				}
+				_ = decisionLease.Close()
+			}
 		})
 	}
 	t.Run("respond-skips-response", func(t *testing.T) {
@@ -508,6 +522,23 @@ func TestRunnerDetectsRevisionMismatchBeforeCommit(t *testing.T) {
 	var processing *model.ProcessingError
 	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorProtocol || tx.Revision() != 2 {
 		t.Fatalf("stale result was not rejected: error=%v revision=%d", err, tx.Revision())
+	}
+}
+
+func TestRunnerRejectsMismatchedInvocationKeyAndReleasesItsResult(t *testing.T) {
+	tx, ledger, _ := newTransaction(t, "invocation-key", "")
+	fake := newFake(t, "wrong-invocation", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		finish(t, completion, mustRequestChange(t, ledger, model.RequestPatch{Method: model.Optional[string]{Present: true, Value: "PATCH"}}), nil)
+	})
+	fake.mutateKey = func(key model.InvocationKey) model.InvocationKey {
+		key.Invocation = "wrong-key"
+		return key
+	}
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	var processing *model.ProcessingError
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorInvalidOutput || fake.lifecycle.Active() != 0 || tx.Revision() != 1 {
+		t.Fatalf("mismatched Invocation key was accepted or retained: err=%v active=%d revision=%d", err, fake.lifecycle.Active(), tx.Revision())
 	}
 }
 
