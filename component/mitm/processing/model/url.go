@@ -70,6 +70,7 @@ func (u URLValue) Path() string        { return u.path }
 func (u URLValue) EscapedPath() string { return u.escapedPath }
 func (u URLValue) RawQuery() string    { return u.rawQuery }
 func (u URLValue) ForceQuery() bool    { return u.forceQuery }
+func (u URLValue) Profile() URLProfile { return u.profile }
 func (u URLValue) clone(to *CopyLease) (URLValue, error) {
 	if u.raw == "" {
 		return URLValue{}, ErrInvalid

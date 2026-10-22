@@ -14,7 +14,7 @@ import (
 func TestModelDependencyBoundary(t *testing.T) {
 	// Exact stdlib allowlist: engine, host, parent MITM, native and IPC imports
 	// cannot accidentally enter the leaf model package.
-	allowed := map[string]bool{"context": true, "errors": true, "math": true, "sync": true, "sync/atomic": true, "net/textproto": true, "strings": true, "net/url": true, "strconv": true, "io": true, "time": true}
+	allowed := map[string]bool{"context": true, "errors": true, "fmt": true, "math": true, "sync": true, "sync/atomic": true, "net/textproto": true, "strings": true, "net/url": true, "strconv": true, "io": true, "time": true}
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +40,8 @@ func TestModelDependencyBoundary(t *testing.T) {
 			return true
 		})
 	}
-	// No pre-existing production package may import the new infrastructure yet.
+	// The processor layer is the one intentional production dependency on the
+	// model. No protocol, engine, or existing production package may import it.
 	const target = "github.com/metacubex/mihomo/component/mitm/processing/model"
 	root := filepath.Clean("../../../..")
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
@@ -48,7 +49,7 @@ func TestModelDependencyBoundary(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || path == filepath.Join(root, "component", "mitm", "processing", "model") || strings.HasPrefix(entry.Name(), ".") && path != root {
+			if entry.Name() == ".git" || path == filepath.Join(root, "component", "mitm", "processing", "model") || path == filepath.Join(root, "component", "mitm", "processing", "processor") || strings.HasPrefix(entry.Name(), ".") && path != root {
 				return filepath.SkipDir
 			}
 			return nil
