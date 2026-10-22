@@ -23,6 +23,7 @@ import (
 
 type h2Harness struct {
 	client  *http2.ClientConn
+	wire    http.RoundTripper
 	manager *Manager
 	streams atomic.Int32
 	dials   atomic.Int32
@@ -41,11 +42,15 @@ func newH2HarnessWithManager(t *testing.T, manager *Manager, upstreamHandler htt
 }
 
 func newH2HarnessTarget(t *testing.T, manager *Manager, targetHost string, targetPort uint16, upstreamHandler http.Handler, failDial, trust bool, options ...func(*Config)) *h2Harness {
+	return newProtocolHarness(t, manager, targetHost, targetPort, upstreamHandler, failDial, trust, true, []string{"http/1.1"}, options...)
+}
+
+func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targetPort uint16, upstreamHandler http.Handler, failDial, trust, downstreamH2 bool, protocols []string, options ...func(*Config)) *h2Harness {
 	t.Helper()
 	h := &h2Harness{done: make(chan dispatchResult, 1)}
 	cert, roots := makeTestUpstreamCertificateFor(t, targetHost)
 	upstream := httptest.NewUnstartedServer(upstreamHandler)
-	upstream.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}}
+	upstream.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: protocols}
 	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
 		if state == http.StateNew {
 			h.active.Add(1)
@@ -54,14 +59,15 @@ func newH2HarnessTarget(t *testing.T, manager *Manager, targetHost string, targe
 			h.active.Add(-1)
 		}
 	}
+	upstream.EnableHTTP2 = true
 	upstream.StartTLS()
 	t.Cleanup(upstream.Close)
 	authority, clientRoots := makeTestAuthority(t)
 	cfg := Config{Enabled: true, Ports: []uint16{443}, Domains: []string{"localhost"}, CA: authority,
 		HandshakeTimeout: time.Second, RequestTimeout: 3 * time.Second, IdleTimeout: 3 * time.Second, ReadHeaderTimeout: time.Second,
 		RequestHook: func(r *http.Request) error {
-			if r.ProtoMajor != 2 || r.TLS == nil || r.TLS.NegotiatedProtocol != "h2" {
-				return errors.New("not a TLS HTTP/2 stream")
+			if (r.ProtoMajor == 2) != downstreamH2 || r.TLS == nil || downstreamH2 && r.TLS.NegotiatedProtocol != "h2" {
+				return errors.New("unexpected downstream TLS HTTP protocol")
 			}
 			h.streams.Add(1)
 			return nil
@@ -112,16 +118,30 @@ func newH2HarnessTarget(t *testing.T, manager *Manager, targetHost string, targe
 	}()
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", listener.Addr().String())
 	require.NoError(t, err)
-	secure := tls.Client(raw, &tls.Config{RootCAs: clientRoots, ServerName: "localhost", NextProtos: []string{"h2", "http/1.1"}, MinVersion: tls.VersionTLS12})
+	clientProtocols := []string{"http/1.1"}
+	if downstreamH2 {
+		clientProtocols = []string{"h2", "http/1.1"}
+	}
+	secure := tls.Client(raw, &tls.Config{RootCAs: clientRoots, ServerName: "localhost", NextProtos: clientProtocols, MinVersion: tls.VersionTLS12})
 	handshakeCtx, stop := context.WithTimeout(ctx, 3*time.Second)
 	err = secure.HandshakeContext(handshakeCtx)
 	stop()
 	require.NoError(t, err)
-	require.Equal(t, "h2", secure.ConnectionState().NegotiatedProtocol)
-	h.client, err = (&http2.Transport{}).NewClientConn(secure)
-	require.NoError(t, err)
+	if downstreamH2 {
+		require.Equal(t, "h2", secure.ConnectionState().NegotiatedProtocol)
+		h.client, err = (&http2.Transport{}).NewClientConn(secure)
+		require.NoError(t, err)
+		h.wire = h.client
+	} else {
+		h.wire = &http.Transport{TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}, DialTLSContext: func(context.Context, string, string) (net.Conn, error) { return secure, nil }}
+	}
 	t.Cleanup(func() {
-		_ = h.client.Close()
+		if h.client != nil {
+			_ = h.client.Close()
+		} else {
+			h.wire.(*http.Transport).CloseIdleConnections()
+			_ = secure.Close()
+		}
 		defer cancel()
 		select {
 		case result := <-h.done:

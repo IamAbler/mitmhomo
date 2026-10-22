@@ -148,7 +148,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	if upstreamRoots == nil {
 		upstreamRoots = ca.GetCertPool()
 	}
-	upstreamTLSConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: upstreamRoots, NextProtos: []string{"http/1.1"}}
+	upstreamTLSConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: upstreamRoots, NextProtos: []string{"h2", "http/1.1"}}
 	originHost := normalizeDomain(metadata.Host)
 	if originHost == "" {
 		originHost = normalizeDomain(hello.ServerName)
@@ -178,6 +178,9 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		defer cancel(context.Canceled)
 		initialURL := *urlTarget
 		request := r.Clone(requestCtx)
+		// Capture before a replacement starts discarding the original H1 body;
+		// EOF can also initialize the server's Trailer field for late trailers.
+		inboundTrailers := r.Trailer
 		request.URL = urlTarget
 		request.RequestURI = ""
 		var discardedBody *requestBodyDiscard
@@ -243,12 +246,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		}
 		proxy := &httputil.ReverseProxy{
 			Transport: &nativeRoundTripper{
-				inboundH2Trailers: func() http.Header {
-					if r.ProtoMajor == 2 {
-						return r.Trailer
-					}
-					return nil
-				}(),
+				inboundTrailers:  inboundTrailers,
 				target:           targetMetadata,
 				dial:             dial,
 				tlsConfig:        upstreamTLSConfig,
@@ -959,70 +957,26 @@ func (listener *singleConnListener) Close() error {
 	return nil
 }
 
-// nativeRoundTripper gives each HTTP request its own upstream Transport. The
-// Transport may detach its dial context from the request so that a late dial
-// can populate its connection pool. M1 disables upstream connection reuse, so
-// capture the exact request context and target in this RoundTripper instead of
-// relying on Transport to preserve request Context values for DialTLSContext.
+// nativeRoundTripper owns one request and its native route. Connections are
+// never shared across requests: the native dialer re-evaluates policy each time.
 type nativeRoundTripper struct {
-	inboundH2Trailers http.Header
-	target            *C.Metadata
-	dial              NativeDialContext
-	tlsConfig         *tls.Config
-	handshakeTimeout  time.Duration
-	requestTimeout    time.Duration
-	idleTimeout       time.Duration
+	inboundTrailers  http.Header
+	target           *C.Metadata
+	dial             NativeDialContext
+	tlsConfig        *tls.Config
+	handshakeTimeout time.Duration
+	requestTimeout   time.Duration
+	idleTimeout      time.Duration
 }
 
 func (roundTripper *nativeRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	if roundTripper.target == nil || roundTripper.dial == nil {
 		return nil, errors.New("native outbound target or dialer is unavailable")
 	}
-	if err := bridgeHTTP2RequestTrailers(request, roundTripper.inboundH2Trailers); err != nil {
+	if err := bridgeRequestTrailers(request, roundTripper.inboundTrailers); err != nil {
 		return nil, err
 	}
-	requestCtx := request.Context()
-	target := roundTripper.target.Clone()
-	tlsConfig := roundTripper.tlsConfig
-	transport := &http.Transport{
-		Proxy:           nil,
-		TLSClientConfig: tlsConfig,
-		// Each request owns this transport. CloseIdleConnections below prevents
-		// pooling without forcing Connection: close onto upstream responses.
-		DisableKeepAlives:     false,
-		ForceAttemptHTTP2:     false,
-		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{},
-		TLSHandshakeTimeout:   roundTripper.handshakeTimeout,
-		ResponseHeaderTimeout: roundTripper.requestTimeout,
-		IdleConnTimeout:       roundTripper.idleTimeout,
-		DialTLSContext: func(_ context.Context, _, address string) (net.Conn, error) {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, fmt.Errorf("parse upstream TLS address %q: %w", address, err)
-			}
-			serverTLSConfig := tlsConfig.Clone()
-			// The request URL is the source of truth after URL Rewrite. Use its
-			// hostname for both SNI and certificate verification even when the
-			// physical Native Dialer connects through a different address.
-			serverName := request.URL.Hostname()
-			if serverName == "" {
-				serverName = strings.Trim(host, "[]")
-			}
-			serverTLSConfig.ServerName = serverName
-			handshakeCtx, cancel := context.WithTimeout(requestCtx, roundTripper.handshakeTimeout)
-			defer cancel()
-			handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
-				tlsConn := tls.Client(conn, serverTLSConfig.Clone())
-				if err := tlsConn.HandshakeContext(ctx); err != nil {
-					return nil, err
-				}
-				return tlsConn, nil
-			}
-			return roundTripper.dial(handshakeCtx, target.Clone(), handshake)
-		},
-	}
-	defer transport.CloseIdleConnections()
-	response, err := transport.RoundTrip(request)
+	response, err := roundTripper.roundTripProtocol(request)
 	if err != nil {
 		return response, err
 	}

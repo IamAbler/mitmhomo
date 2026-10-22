@@ -27,8 +27,10 @@ func serveHTTP2Connection(ctx context.Context, conn *tls.Conn, base *http.Server
 // Request.Clone copies Trailer before the server body has populated its values.
 // Bridge only declared fields, at EOF, into the final Transport request map.
 // A replacement body clears Trailer and must never inherit upload trailers.
-func bridgeHTTP2RequestTrailers(request *http.Request, source http.Header) error {
-	if len(source) == 0 || len(request.Trailer) == 0 {
+func bridgeRequestTrailers(request *http.Request, source http.Header) error {
+	// A replaced H1 body can be discarded concurrently, filling source at EOF.
+	// Check the final request first and never inspect source before its Body EOF.
+	if len(request.Trailer) == 0 || source == nil {
 		return nil
 	}
 	if err := validateResponseTrailers(request.Trailer); err != nil {
@@ -36,16 +38,16 @@ func bridgeHTTP2RequestTrailers(request *http.Request, source http.Header) error
 	}
 	request.ContentLength = -1 // H1 trailers require chunked framing, even for known H2 lengths.
 	request.Header.Del("Content-Length")
-	request.Body = &http2RequestTrailerBody{ReadCloser: request.Body, source: source, target: request.Trailer}
+	request.Body = &requestTrailerBody{ReadCloser: request.Body, source: source, target: request.Trailer}
 	return nil
 }
 
-type http2RequestTrailerBody struct {
+type requestTrailerBody struct {
 	io.ReadCloser
 	source, target http.Header
 }
 
-func (b *http2RequestTrailerBody) Read(p []byte) (int, error) {
+func (b *requestTrailerBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err == io.EOF {
 		for name := range b.target {
