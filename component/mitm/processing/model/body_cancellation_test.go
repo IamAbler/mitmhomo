@@ -124,7 +124,10 @@ func TestBodyExplicitInterruptAndAdmission(t *testing.T) {
 			returned := make(chan error, 1)
 			go func() { returned <- broker.Prepare(ctx, FullBuffered, 32) }()
 			awaitBody(t, reader.entered)
-			if _, err = broker.Snapshot(NewCopyLease(ledger)); !errors.Is(err, ErrBodyBusy) {
+			busyLease := NewCopyLease(ledger)
+			_, err = broker.Snapshot(busyLease)
+			busyLease.Close()
+			if !errors.Is(err, ErrBodyBusy) {
 				t.Fatal(err)
 			}
 			duplicateCtx, stopDuplicate := context.WithCancel(context.Background())
@@ -199,11 +202,13 @@ func TestBodyCanceledAndStaleReadCannotPublish(t *testing.T) {
 			awaitBody(t, reader.entered)
 			if mode == "parent-cancel" {
 				// Hold only the test's state barrier: the real Read no longer holds it.
-				tx.mu.Lock()
-				unblock()
-				cancel(context.DeadlineExceeded)
-				err = awaitBody(t, returned)
-				tx.mu.Unlock()
+				func() {
+					tx.mu.Lock()
+					defer tx.mu.Unlock()
+					unblock()
+					cancel(context.DeadlineExceeded)
+					err = awaitBody(t, returned)
+				}()
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatal(err)
 				}
@@ -232,6 +237,9 @@ func TestBodyCanceledAndStaleReadCannotPublish(t *testing.T) {
 func TestBodyReadFinishTerminateCompetition(t *testing.T) {
 	for round := 0; round < 40; round++ {
 		reader := newControlledBody()
+		var release sync.Once
+		unblock := func() { release.Do(func() { close(reader.release) }) }
+		defer unblock()
 		if round%2 == 0 {
 			reader.result = io.ErrUnexpectedEOF
 		}
@@ -248,7 +256,7 @@ func TestBodyReadFinishTerminateCompetition(t *testing.T) {
 		gate := make(chan struct{})
 		var joined sync.WaitGroup
 		joined.Add(2)
-		go func() { defer joined.Done(); <-gate; close(reader.release) }()
+		go func() { defer joined.Done(); <-gate; unblock() }()
 		go func() { defer joined.Done(); <-gate; tx.Terminate(context.DeadlineExceeded) }()
 		close(gate)
 		joined.Wait()
@@ -385,7 +393,10 @@ func TestBodyStreamingCancellationAndBorrowedBuffer(t *testing.T) {
 
 func TestBodyStreamingReadHasNoPerReadAllocation(t *testing.T) {
 	ledger := testLedger(t, 0)
-	broker, _ := NewBodyBroker(context.Background(), BodySource{Reader: io.NopCloser(&generatedBody{10000}), Owner: FrameworkOwned, DeclaredLength: 10000}, ledger)
+	broker, constructionErr := NewBodyBroker(context.Background(), BodySource{Reader: io.NopCloser(&generatedBody{10000}), Owner: FrameworkOwned, DeclaredLength: 10000}, ledger)
+	if constructionErr != nil {
+		t.Fatal(constructionErr)
+	}
 	defer broker.Close()
 	stream, err := broker.TakeStream(context.Background())
 	if err != nil {
