@@ -119,3 +119,69 @@ func TestPlanBuildFailureCleansOwnedResources(t *testing.T) {
 		t.Fatal("candidate cleanup")
 	}
 }
+
+func TestEmptyPlanRejectsForeignAndClosedParent(t *testing.T) {
+	plan, e := NewPlan(nil)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var p Publisher
+	p.Publish(plan.Generation)
+	l, _ := p.Bind()
+	r, _ := plan.Runner(l)
+	tx := transaction(t, plan.Generation.ID()+1)
+	defer tx.Close()
+	if _, e = r.Run(context.Background(), tx, model.RequestPhase); e == nil {
+		t.Fatal("foreign generation")
+	}
+	l.Close()
+	tx2 := transaction(t, plan.Generation.ID())
+	defer tx2.Close()
+	if _, e = r.Run(context.Background(), tx2, model.RequestPhase); e == nil {
+		t.Fatal("closed parent")
+	}
+	p.Close()
+}
+func BenchmarkGenerationPipeline(b *testing.B) {
+	life, _ := processor.NewLifecycle(1)
+	p := &syncProcessor{life}
+	plan, e := NewPlan([]pipeline.Entry{{Class: pipeline.Script, Processor: p}})
+	if e != nil {
+		b.Fatal(e)
+	}
+	var pub Publisher
+	pub.Publish(plan.Generation)
+	defer pub.Close()
+	conn, _ := pub.Bind()
+	defer conn.Close()
+	r, _ := plan.Runner(conn)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx := transaction(b, plan.Generation.ID())
+		b.StartTimer()
+		_, e := r.Run(context.Background(), tx, model.RequestPhase)
+		if e != nil {
+			b.Fatal(e)
+		}
+		b.StopTimer()
+		tx.Close()
+		b.StartTimer()
+	}
+}
+
+type syncProcessor struct{ l *processor.Lifecycle }
+
+func (p *syncProcessor) Describe() processor.Descriptor {
+	return processor.Descriptor{ID: "sync", Backend: "test", ContractVersion: 1, Request: true}
+}
+func (p *syncProcessor) Start(ctx context.Context, in model.Input, resources ...io.Closer) (*processor.Invocation, error) {
+	i, c, e := p.l.BeginWithResources(ctx, in.Key(), resources...)
+	if e == nil {
+		c.Finish(model.Continue(), nil)
+	}
+	return i, e
+}
+func (p *syncProcessor) Close() error                         { return p.l.Close() }
+func (p *syncProcessor) WaitClosed(ctx context.Context) error { return p.l.WaitClosed(ctx) }

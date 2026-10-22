@@ -136,6 +136,9 @@ type TransactionOptions struct {
 	Ledger          *Ledger
 }
 
+// GenerationID is immutable for the entire transaction lifetime.
+func (t *Transaction) GenerationID() GenerationID { return t.generation }
+
 // Transaction is an owner API, not a processor input. Mutations require the
 // current revision. Its lock also permits cancellation/Close racing snapshots.
 // Successful construction/EnterResponse transfers the supplied BodySlot to it;

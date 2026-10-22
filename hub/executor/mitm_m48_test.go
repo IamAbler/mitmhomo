@@ -11,11 +11,16 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/mitm"
 	"github.com/metacubex/mihomo/component/mitm/httphook"
 	"github.com/metacubex/mihomo/component/mitm/processing/generation"
+	"github.com/metacubex/mihomo/component/mitm/processing/model"
+	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
+	"github.com/metacubex/mihomo/component/mitm/processing/processor"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub"
@@ -39,6 +44,8 @@ func TestM48RealConfigPublication(t *testing.T) {
 	home := t.TempDir()
 	C.SetHomeDir(home)
 	roots := m35ExecutorCA(t, home)
+	lifecycle, _ := processor.NewLifecycle(1)
+	async := &m48AsyncProcessor{l: lifecycle, started: make(chan *processor.Invocation, 1), finish: make(chan *processor.Completion, 1)}
 	yaml := func(version string, enabled bool) []byte {
 		return []byte(fmt.Sprintf(`mode: direct
 log-level: silent
@@ -66,6 +73,30 @@ mitm:
 	apply := func(version string, enabled bool) *generation.Generation {
 		cfg, e := config.Parse(yaml(version, enabled))
 		require.NoError(t, e)
+		if version == "old" {
+			cfg.MITM.ProcessorFactory = func() ([]pipeline.Entry, error) {
+				return []pipeline.Entry{{Class: pipeline.Script, Processor: async}}, nil
+			}
+			cfg.MITM.RequestHook = func(request *http.Request) error {
+				if request.URL.Path != "/async" {
+					return nil
+				}
+				runner, ok := mitm.ProcessingRunnerFromContext(request.Context())
+				if !ok {
+					return fmt.Errorf("missing bound pipeline")
+				}
+				tx, e := m48Transaction(runner.GenerationID())
+				if e != nil {
+					return e
+				}
+				defer tx.Close()
+				_, e = runner.Run(request.Context(), tx, model.RequestPhase)
+				if e == nil {
+					return fmt.Errorf("expected canceled invocation")
+				}
+				return nil
+			}
+		}
 		require.NoError(t, hub.ApplyConfig(cfg))
 		return tunnel.MITMGeneration()
 	}
@@ -121,7 +152,21 @@ mitm:
 	h1, h2 := start(false), start(true)
 	send(h1, "old")
 	send(h2, "old")
+	asyncResponse := make(chan error, 1)
+	go func() {
+		r, _ := http.NewRequestWithContext(ctx, "GET", "https://localhost/async", nil)
+		resp, e := h2.rt.RoundTrip(r)
+		if e == nil {
+			_, e = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		asyncResponse <- e
+	}()
+	invocation := <-async.started
+	completion := <-async.finish
 	second := apply("second", true)
+	invocation.Cancel(context.Canceled)
+	require.NoError(t, <-asyncResponse)
 	require.Equal(t, generation.Retiring, old.State())
 	send(h1, "old")
 	send(h2, "old")
@@ -149,6 +194,16 @@ mitm:
 	require.Error(t, hub.ApplyConfig(invalid))
 	require.Same(t, third, tunnel.MITMGeneration())
 	require.NoError(t, invalid.MITM.ScriptHooks.Close())
+	invalid, e = config.Parse(yaml("failed-factory", true))
+	require.NoError(t, e)
+	partialLife, _ := processor.NewLifecycle(1)
+	partial := &m48AsyncProcessor{l: partialLife}
+	invalid.MITM.ProcessorFactory = func() ([]pipeline.Entry, error) {
+		return []pipeline.Entry{{Class: pipeline.Script, Processor: partial}}, fmt.Errorf("processor initialization failed")
+	}
+	require.Error(t, hub.ApplyConfig(invalid))
+	require.EqualValues(t, 1, partial.closed.Load())
+	require.Same(t, third, tunnel.MITMGeneration())
 	require.Nil(t, apply("off", false))
 	send(h2, "old")
 	send(newest, "third")
@@ -182,8 +237,63 @@ mitm:
 		}
 	}
 	for _, g := range []*generation.Generation{old, second, third, fourth} {
+		if g == old {
+			require.Equal(t, generation.Retiring, g.State())
+			require.Equal(t, 1, lifecycle.Active())
+			require.Zero(t, async.closed.Load())
+			require.True(t, completion.Finish(model.Continue(), nil))
+			require.Zero(t, lifecycle.Active())
+			require.EqualValues(t, 1, async.closed.Load())
+		}
 		require.NoError(t, g.WaitClosed(ctx))
 		require.Equal(t, generation.Closed, g.State())
 	}
 	t.Log("Parse -> hub.ApplyConfig -> executor.ApplyConfig -> Tunnel; H1/H2 pinned; rollback, disable/re-enable, concurrent ApplyConfig, explicit drain PASS")
+}
+
+type m48AsyncProcessor struct {
+	closed  atomic.Int32
+	l       *processor.Lifecycle
+	started chan *processor.Invocation
+	finish  chan *processor.Completion
+}
+
+func (p *m48AsyncProcessor) Describe() processor.Descriptor {
+	return processor.Descriptor{ID: "m48-async", Backend: "test-adapter", ContractVersion: 1, Request: true}
+}
+func (p *m48AsyncProcessor) Start(ctx context.Context, in model.Input, resources ...io.Closer) (*processor.Invocation, error) {
+	i, c, e := p.l.BeginWithResources(ctx, in.Key(), resources...)
+	if e == nil {
+		p.started <- i
+		p.finish <- c
+	}
+	return i, e
+}
+func (p *m48AsyncProcessor) Close() error                         { p.closed.Add(1); return p.l.Close() }
+func (p *m48AsyncProcessor) WaitClosed(ctx context.Context) error { return p.l.WaitClosed(ctx) }
+func m48Transaction(id model.GenerationID) (*model.Transaction, error) {
+	ledger, e := model.NewLedger(-1, nil)
+	if e != nil {
+		return nil, e
+	}
+	copy := model.NewCopyLease(ledger)
+	defer copy.Close()
+	u, e := model.ParseURL(copy, "https://localhost/async", model.MITMHTTPS)
+	if e != nil {
+		return nil, e
+	}
+	headers, e := model.NewHeaderBlock(copy, nil)
+	if e != nil {
+		return nil, e
+	}
+	trailers, e := model.NewTrailerView(model.TrailerUnavailable, model.HeaderBlock{}, model.HeaderBlock{})
+	if e != nil {
+		return nil, e
+	}
+	head := model.RequestHead{Method: "GET", URL: u, Authority: "localhost", Headers: headers, Trailers: trailers}
+	broker, e := model.NewBodyBroker(context.Background(), model.BodySource{Owner: model.FrameworkOwned}, ledger)
+	if e != nil {
+		return nil, e
+	}
+	return model.NewTransaction(context.Background(), model.TransactionOptions{ID: "real-config-async", Generation: id, Connection: model.ConnectionView{ID: "real-h2", StreamID: "async"}, OriginalIngress: head, Request: head, RequestBody: model.NewBodySlot(broker), Ledger: ledger})
 }

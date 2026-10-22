@@ -35,13 +35,26 @@ type Generation struct {
 	closing                               bool
 	done                                  chan struct{}
 	err                                   error
+	observer                              func(error)
 }
 
 func New(resources ...io.Closer) *Generation {
 	return &Generation{id: model.GenerationID(sequence.Add(1)), resources: append([]io.Closer(nil), resources...), done: make(chan struct{})}
 }
 func (g *Generation) ID() model.GenerationID { return g.id }
-func (g *Generation) State() State           { g.mu.Lock(); defer g.mu.Unlock(); return g.state }
+
+// ObserveCleanup installs diagnostics before activation. Errors also remain
+// available through WaitClosed and CloseError.
+func (g *Generation) ObserveCleanup(observer func(error)) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state != Building {
+		return ErrUnavailable
+	}
+	g.observer = observer
+	return nil
+}
+func (g *Generation) State() State { g.mu.Lock(); defer g.mu.Unlock(); return g.state }
 func (g *Generation) Activate() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -95,7 +108,12 @@ func (g *Generation) cleanup() {
 	g.err = err
 	g.state = Closed
 	close(g.done)
+	observer := g.observer
+	g.observer = nil
 	g.mu.Unlock()
+	if observer != nil {
+		observer(err)
+	}
 }
 
 // Lease is a capability. Child admission and parent Close share the same lock,

@@ -14,9 +14,11 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/mitm/httphook"
 	"github.com/metacubex/mihomo/component/mitm/processing/generation"
+	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
 	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	domainname "github.com/metacubex/sing/common/metadata"
 )
 
@@ -34,6 +36,10 @@ type PortRange struct {
 // names and *.suffix patterns; an empty CA is valid only for parser-only tests
 // and can never complete a TLS interception.
 type Config struct {
+	// ProcessorFactory is the engine adapter boundary, not a YAML backend.
+	// Each call transfers fresh, exclusively owned processors, including any
+	// partial result on error. Nil means the existing legacy-only HTTP path.
+	ProcessorFactory   func() ([]pipeline.Entry, error)
 	Enabled            bool
 	Ports              []uint16
 	PortRanges         []PortRange
@@ -58,6 +64,7 @@ type Config struct {
 
 type configSnapshot struct {
 	generation   *generation.Generation
+	plan         *generation.Plan
 	config       Config
 	ports        map[uint16]struct{}
 	portRanges   []PortRange
@@ -91,22 +98,23 @@ func BuildManager(config Config) (*Manager, error) {
 	if config.Enabled && (config.CA == nil || config.CA.signer == nil || config.CA.leaf == nil) {
 		return nil, errors.New("MITM candidate requires a validated CA")
 	}
-	manager := NewManager(config)
-	if err := manager.snapshot.Load().config.ScriptHooks.Prepare(); err != nil {
-		_ = manager.Close()
+	manager := &Manager{}
+	if err := manager.update(config, true); err != nil {
 		return nil, err
 	}
 	return manager, nil
 }
 
-func (m *Manager) Update(config Config) {
+func (m *Manager) Update(config Config) error { return m.update(config, false) }
+
+func (m *Manager) update(config Config, prepare bool) error {
 	if m == nil {
-		return
+		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return
+		return generation.ErrUnavailable
 	}
 	snapshot := &configSnapshot{
 		config: Config{
@@ -149,13 +157,42 @@ func (m *Manager) Update(config Config) {
 			snapshot.domains[domain] = struct{}{}
 		}
 	}
+	var entries []pipeline.Entry
+	if config.Enabled && config.ProcessorFactory != nil {
+		var err error
+		entries, err = config.ProcessorFactory()
+		if err != nil {
+			for _, entry := range entries {
+				if entry.Processor != nil {
+					err = errors.Join(err, entry.Processor.Close())
+				}
+			}
+			return errors.Join(err, snapshot.config.ScriptHooks.Close())
+		}
+	}
+	plan, err := generation.NewPlan(entries, snapshot.config.ScriptHooks)
+	if err != nil {
+		return err
+	}
+	snapshot.plan = plan
+	snapshot.generation = plan.Generation
+	_ = snapshot.generation.ObserveCleanup(func(err error) {
+		if err != nil {
+			log.Warnln("[MITM] generation %d cleanup: %v", snapshot.generation.ID(), err)
+		}
+	})
+	if prepare {
+		if err := snapshot.config.ScriptHooks.Prepare(); err != nil {
+			return errors.Join(err, snapshot.generation.Close())
+		}
+	}
 	snapshot.refs.Store(1) // Manager ownership, released on the next Update.
-	snapshot.generation = generation.New(snapshot.config.ScriptHooks)
 	_ = snapshot.generation.Activate()
 	previous := m.snapshot.Swap(snapshot)
 	if previous != nil {
 		previous.retire()
 	}
+	return nil
 }
 
 func cloneScriptHooks(enabled bool, hooks *httphook.Snapshot, services httphook.Services) *httphook.Snapshot {

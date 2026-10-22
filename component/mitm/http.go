@@ -194,6 +194,12 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 			return
 		}
 		defer stream.Close()
+		processing, err := snapshot.plan.Runner(stream)
+		if err != nil {
+			rejectRequest(w, r, http.StatusServiceUnavailable, "processing unavailable")
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), processingContextKey{}, processing))
 		if !(r.ProtoMajor == 1 && r.ProtoMinor == 1 || r.ProtoMajor == 2 && tlsConn.ConnectionState().NegotiatedProtocol == "h2") {
 			rejectRequest(w, r, http.StatusHTTPVersionNotSupported, "HTTP/1.1 or negotiated HTTP/2 is required")
 			return
