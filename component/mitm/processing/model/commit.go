@@ -29,13 +29,25 @@ func (t *Transaction) AcquirePipelinePhase(ctx context.Context, phase Phase) (*P
 	}
 	select {
 	case <-ctx.Done():
-		return nil, false, context.Cause(ctx)
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		return nil, false, cause
 	case <-t.ctx.Done():
-		return nil, false, context.Cause(t.ctx)
+		cause := context.Cause(t.ctx)
+		if cause == nil {
+			cause = t.ctx.Err()
+		}
+		return nil, false, cause
 	case <-t.pipelineGate:
 	}
 	t.mu.Lock()
-	if err := context.Cause(ctx); ctx.Err() != nil {
+	if ctx.Err() != nil {
+		err := context.Cause(ctx)
+		if err == nil {
+			err = ctx.Err()
+		}
 		t.mu.Unlock()
 		t.pipelineGate <- struct{}{}
 		return nil, false, err
@@ -141,6 +153,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 	switch result.Kind() {
 	case ResultContinue, ResultStopPhase:
 		t.currentInvocation = ""
+		t.revision++
 		return result.Kind(), nil
 	case ResultRequestChange:
 		patch := *result.payload.request

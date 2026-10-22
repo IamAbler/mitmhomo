@@ -206,6 +206,23 @@ func TestCommitBindsConnectionAndSingleInvocation(t *testing.T) {
 	}
 }
 
+func TestContinueCommitConsumesInvocationRevision(t *testing.T) {
+	ledger := testLedger(t, -1)
+	tx, sourceLease := testTransaction(t, context.Background(), ledger, BodySlot{})
+	sourceLease.Close()
+	input, lease, err := tx.Snapshot("continue-once")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	if kind, err := tx.Commit(input, Continue()); err != nil || kind != ResultContinue || tx.Revision() != 2 {
+		t.Fatalf("Continue did not commit its revision: kind=%d rev=%d err=%v", kind, tx.Revision(), err)
+	}
+	if _, err := tx.Commit(input, Continue()); !errors.Is(err, ErrStaleRevision) {
+		t.Fatalf("same result committed twice: %v", err)
+	}
+}
+
 func TestPipelinePhasePermitSerializesConcurrentRunners(t *testing.T) {
 	for round := 0; round < 20; round++ {
 		ledger := testLedger(t, -1)

@@ -106,10 +106,14 @@ type Report struct {
 
 var invocationSequence atomic.Uint64
 
+var errExecutionResourceCleanup = errors.New("execution resource cleanup failed")
+
 func NewRunner(entries []Entry, options Options) (*Runner, error) {
 	copyEntries := append([]Entry(nil), entries...)
 	for _, entry := range copyEntries {
-		if entry.Processor == nil || entry.Class < InternalHook || entry.Class > Rewrite || entry.Profile > LegacyProfile {
+		// Legacy fallback is enabled only when the integration supplies a
+		// per-entry guard that can reject fallback after irreversible I/O.
+		if entry.Processor == nil || entry.Class < InternalHook || entry.Class > Rewrite || entry.Profile > LegacyProfile || entry.Profile == LegacyProfile && entry.FailOpenSafe == nil {
 			return nil, model.ErrInvalid
 		}
 	}
@@ -153,6 +157,11 @@ func (r *Runner) Run(ctx context.Context, tx *model.Transaction, phase model.Pha
 		return report, nil
 	}
 	defer permit.Release()
+	// Observe cancellation and an existing BodyBroker fault without consuming
+	// the real source. FullBuffered still waits until after metadata selection.
+	if err := tx.PrepareBody(model.None, 0); err != nil {
+		return r.terminate(tx, report, classifyBody(err, phase, "", ""))
+	}
 
 	for _, class := range []Class{InternalHook, Script, Rewrite} {
 		matchedScript := false
@@ -316,12 +325,13 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	if r.options.AcquireGeneration != nil {
 		generation, err := r.options.AcquireGeneration(ctx, key.Generation)
 		if err != nil {
-			closeResources(resources)
-			return model.DoneResult{}, input, nil, false, true, classify(err, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginConnection)
+			cleanupErr := closeResources(resources)
+			return model.DoneResult{}, input, nil, false, cleanupErr == nil, classify(joinCleanup(err, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginConnection)
 		}
 		if generation == nil {
-			closeResources(resources)
-			return model.DoneResult{}, input, nil, false, true, model.NewProcessingError(model.ProcessingErrorInvalidInput, model.ProcessingOriginConnection, key.Phase, descriptor.ID, key.Invocation, model.ErrInvalid)
+			cleanupErr := closeResources(resources)
+			cause := joinCleanup(model.ErrInvalid, cleanupErr)
+			return model.DoneResult{}, input, nil, false, cleanupErr == nil, model.NewProcessingError(model.ProcessingErrorInvalidInput, model.ProcessingOriginConnection, key.Phase, descriptor.ID, key.Invocation, cause)
 		}
 		prepareResource(generation)
 	}
@@ -331,31 +341,36 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 			prepareResource(resource)
 		}
 		if err != nil {
-			closeResources(resources)
-			return model.DoneResult{}, input, nil, false, true, classify(err, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
+			cleanupErr := closeResources(resources)
+			return model.DoneResult{}, input, nil, false, cleanupErr == nil, classify(joinCleanup(err, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
 		}
 	}
 	if ctx.Err() != nil || tx.Context().Err() != nil {
-		closeResources(resources)
+		cleanupErr := closeResources(resources)
 		cause := context.Cause(ctx)
 		if tx.Context().Err() != nil {
 			cause = tx.CancellationCause()
 		}
-		return model.DoneResult{}, input, nil, false, true, classify(cause, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginRequest)
+		return model.DoneResult{}, input, nil, false, cleanupErr == nil, classify(joinCleanup(cause, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginRequest)
 	}
+	// Invocation releases resources in slice order. Pass the reverse of
+	// acquisition order so task/admission resources close first, followed by
+	// the generation pin and finally the Input CopyLease.
 	closers := make([]io.Closer, len(resources))
-	copy(closers, resources)
+	for i := range resources {
+		closers[len(resources)-1-i] = resources[i]
+	}
 	invocation, startErr := entry.Processor.Start(tx.Context(), input, closers...)
 	if startErr != nil {
-		closeResources(resources)
+		cleanupErr := closeResources(resources)
 		if invocation != nil {
 			invocation.Cancel(startErr)
 		}
-		return model.DoneResult{}, input, nil, true, invocation == nil || channelClosed(invocation.ExecutionDone()), classify(startErr, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
+		return model.DoneResult{}, input, nil, true, cleanupErr == nil && (invocation == nil || channelClosed(invocation.ExecutionDone())), classify(joinCleanup(startErr, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
 	}
 	if invocation == nil {
-		closeResources(resources)
-		return model.DoneResult{}, input, nil, true, true, model.NewProcessingError(model.ProcessingErrorExecution, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, model.ErrInvalid)
+		cleanupErr := closeResources(resources)
+		return model.DoneResult{}, input, nil, true, cleanupErr == nil, model.NewProcessingError(model.ProcessingErrorExecution, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, joinCleanup(model.ErrInvalid, cleanupErr))
 	}
 	if invocation.Key() != key {
 		invocation.Cancel(model.ErrInvalid)
@@ -371,7 +386,8 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	cancel()
 	if awaitErr != nil {
 		_ = result.Release()
-		return model.DoneResult{}, input, nil, true, channelClosed(invocation.ExecutionDone()), classify(awaitErr, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
+		cleanupErr := invocation.CleanupError()
+		return model.DoneResult{}, input, nil, true, channelClosed(invocation.ExecutionDone()), classify(joinCleanup(awaitErr, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
 	}
 	if ctx.Err() != nil || tx.Context().Err() != nil {
 		_ = result.Release()
@@ -385,7 +401,7 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 }
 
 func (r *Runner) canFailOpen(entry Entry, err error, started, executionDone bool) bool {
-	if !entry.AllowFailOpen && entry.Profile != LegacyProfile || !executionDone {
+	if (!entry.AllowFailOpen && entry.Profile != LegacyProfile) || !executionDone || errors.Is(err, errExecutionResourceCleanup) {
 		return false
 	}
 	kind := processingKind(err)
@@ -396,6 +412,13 @@ func (r *Runner) canFailOpen(entry Entry, err error, started, executionDone bool
 		return !started
 	}
 	return entry.FailOpenSafe(err)
+}
+
+func joinCleanup(cause, cleanupErr error) error {
+	if cleanupErr == nil {
+		return cause
+	}
+	return errors.Join(cause, errExecutionResourceCleanup, cleanupErr)
 }
 
 func (r *Runner) terminate(tx *model.Transaction, report Report, err error) (Report, error) {
@@ -467,6 +490,8 @@ func classifyBody(err error, phase model.Phase, processorID string, invocationID
 		kind = model.ProcessingErrorTimeout
 	} else if errors.Is(err, context.Canceled) {
 		kind = model.ProcessingErrorCanceled
+	} else if errors.Is(err, model.ErrBodyClaimed) || errors.Is(err, model.ErrReleased) || errors.Is(err, model.ErrInvalid) || errors.Is(err, model.ErrClosed) {
+		kind = model.ProcessingErrorProtocol
 	}
 	return model.NewProcessingError(kind, model.ProcessingOriginRequest, phase, processorID, invocationID, err)
 }
@@ -477,6 +502,9 @@ func classify(err error, phase model.Phase, processorID string, invocationID mod
 	}
 	var existing *model.ProcessingError
 	if errors.As(err, &existing) {
+		if errors.Is(err, errExecutionResourceCleanup) {
+			return model.NewProcessingError(existing.Kind, existing.Origin, existing.Phase, existing.ProcessorID, existing.InvocationID, err)
+		}
 		return existing
 	}
 	kind := model.ProcessingErrorExecution

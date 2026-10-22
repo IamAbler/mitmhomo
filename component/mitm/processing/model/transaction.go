@@ -461,6 +461,9 @@ func (t *Transaction) Close() error {
 			t.decisionLease.Close()
 			t.decisionLease = nil
 		}
+		t.decisionCode = ""
+		t.decisionReason = ""
+		t.currentInvocation = ""
 	}
 	return t.closeErr
 }

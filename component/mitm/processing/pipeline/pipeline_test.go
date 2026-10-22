@@ -77,6 +77,13 @@ type countCloser struct{ closes atomic.Int64 }
 
 func (c *countCloser) Close() error { c.closes.Add(1); return nil }
 
+type failingCloser struct {
+	closes atomic.Int64
+	err    error
+}
+
+func (c *failingCloser) Close() error { c.closes.Add(1); return c.err }
+
 func newTransaction(t testing.TB, id, body string) (*model.Transaction, *model.Ledger, *countingBody) {
 	t.Helper()
 	var reader *countingBody
@@ -402,6 +409,87 @@ func TestRunnerInvalidAndPhaseMismatchResultsFailClosed(t *testing.T) {
 	}
 }
 
+func TestPipelinePreservesContextAndUpstreamFailureKinds(t *testing.T) {
+	t.Run("parent-cancel", func(t *testing.T) {
+		tx, _, _ := newTransaction(t, "parent-cancel", "")
+		fake := newFake(t, "cancelled", processor.Requirements{}, nil)
+		runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+		ctx, cancel := context.WithCancelCause(context.Background())
+		cancel(context.Canceled)
+		_, err := runner.Run(ctx, tx, model.RequestPhase)
+		var processing *model.ProcessingError
+		if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorCanceled || fake.starts.Load() != 0 || tx.State() != model.Terminated {
+			t.Fatalf("parent cancellation was not terminal: error=%v starts=%d state=%d", err, fake.starts.Load(), tx.State())
+		}
+	})
+	t.Run("upstream-classification", func(t *testing.T) {
+		tx, _, _ := newTransaction(t, "upstream-classification", "")
+		fake := newFake(t, "upstream-error", processor.Requirements{}, nil)
+		fake.startErr = model.NewProcessingError(model.ProcessingErrorUpstream, model.ProcessingOriginUpstream, model.RequestPhase, "upstream-error", "", errors.New("upstream unavailable"))
+		runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+		_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+		var processing *model.ProcessingError
+		if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorUpstream {
+			t.Fatalf("upstream error was collapsed into Processor error: %v", err)
+		}
+	})
+}
+
+func TestExecutionResourceCleanupFailureCannotFailOpen(t *testing.T) {
+	tx, _, _ := newTransaction(t, "cleanup-failure", "")
+	resource := &failingCloser{err: errors.New("close failed")}
+	fake := newFake(t, "must-not-start", processor.Requirements{}, nil)
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake, AllowFailOpen: true, FailOpenSafe: func(error) bool { return true }}}, Options{
+		AcquireExecution: func(context.Context, processor.Descriptor, model.InvocationKey) ([]io.Closer, error) {
+			return []io.Closer{resource}, errors.New("resource admission failed")
+		},
+	})
+	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	if err == nil || fake.starts.Load() != 0 || resource.closes.Load() != 1 || tx.State() != model.Terminated {
+		t.Fatalf("resource cleanup failure was masked: err=%v starts=%d closes=%d state=%d", err, fake.starts.Load(), resource.closes.Load(), tx.State())
+	}
+}
+
+func TestInvocationCleanupFailureCannotFailOpen(t *testing.T) {
+	tx, _, _ := newTransaction(t, "invocation-cleanup-failure", "")
+	resource := &failingCloser{err: errors.New("execution lease close failed")}
+	fake := newFake(t, "cleanup-error", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		finish(t, completion, model.DoneResult{}, errors.New("processor failed"))
+	})
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake, AllowFailOpen: true, FailOpenSafe: func(error) bool { return true }}}, Options{
+		AcquireExecution: func(context.Context, processor.Descriptor, model.InvocationKey) ([]io.Closer, error) {
+			return []io.Closer{resource}, nil
+		},
+	})
+	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	if err == nil || resource.closes.Load() != 1 || fake.lifecycle.Active() != 0 || tx.State() != model.Terminated {
+		t.Fatalf("Invocation cleanup failure was masked: err=%v closes=%d active=%d state=%d", err, resource.closes.Load(), fake.lifecycle.Active(), tx.State())
+	}
+}
+
+func TestRejectPayloadBudgetTransfersToTransaction(t *testing.T) {
+	tx, ledger, _ := newTransaction(t, "reject-budget", "")
+	baseline := ledger.Current()
+	var outputCharge atomic.Int64
+	fake := newFake(t, "reject-budget", processor.Requirements{}, func(_ *processor.Invocation, c *processor.Completion, _ model.Input) {
+		before := ledger.Current()
+		result, err := model.Reject("policy", ledger)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		outputCharge.Store(ledger.Current() - before)
+		finish(t, c, result, nil)
+	})
+	runner, _ := NewRunner([]Entry{{Class: Script, Processor: fake}}, Options{})
+	if report, err := runner.Run(context.Background(), tx, model.RequestPhase); err != nil || report.Outcome != Rejected {
+		t.Fatalf("reject failed: report=%+v err=%v", report, err)
+	}
+	if want, got := baseline+outputCharge.Load(), ledger.Current(); got != want {
+		t.Fatalf("output budget was not transferred/released: want ledger=%d got=%d", want, got)
+	}
+}
+
 func TestRunnerDetectsRevisionMismatchBeforeCommit(t *testing.T) {
 	tx, ledger, _ := newTransaction(t, "revision", "")
 	fake := newFake(t, "revision-race", processor.Requirements{}, func(_ *processor.Invocation, c *processor.Completion, input model.Input) {
@@ -613,6 +701,47 @@ func TestStartFailureReturnsResourcesAndAwaitTimeoutKeepsExecutionLeases(t *test
 	})
 }
 
+func TestDescriptorTotalTimeoutCancelsAwaitWithoutReleasingExecutionLease(t *testing.T) {
+	tx, _, _ := newTransaction(t, "total-timeout", "")
+	type pending struct {
+		invocation *processor.Invocation
+		completion *processor.Completion
+	}
+	started := make(chan pending, 1)
+	fake := newFake(t, "total-timeout", processor.Requirements{TotalTimeout: time.Nanosecond}, func(inv *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		started <- pending{invocation: inv, completion: completion}
+	})
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+	type runResult struct{ err error }
+	done := make(chan runResult, 1)
+	go func() {
+		_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+		done <- runResult{err: err}
+	}()
+	handle := <-started
+	var result runResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("TotalTimeout did not cancel Await")
+	}
+	var processing *model.ProcessingError
+	if !errors.As(result.err, &processing) || processing.Kind != model.ProcessingErrorTimeout {
+		t.Fatalf("TotalTimeout classification mismatch: %v", result.err)
+	}
+	if !channelOpen(handle.invocation.ExecutionDone()) || fake.lifecycle.Active() != 1 {
+		t.Fatal("Await timeout released execution resources before Finish")
+	}
+	finish(t, handle.completion, model.Continue(), nil)
+	if channelOpen(handle.invocation.ExecutionDone()) || fake.lifecycle.Active() != 0 || tx.Revision() != 1 {
+		t.Fatal("late Finish committed or failed to release execution resources")
+	}
+	_ = runner.Close()
+	if err := runner.WaitClosed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMultipleTransactionsRunConcurrentlyAndGenerationStaysConnectionScoped(t *testing.T) {
 	for round := 0; round < 20; round++ {
 		tx1, _, _ := newTransactionConfigured(t, "parallel-a", "conn-h2", "stream-1", nil, 0)
@@ -682,7 +811,7 @@ func TestTransactionCloseRacesAtomicCommit(t *testing.T) {
 		close(barrier)
 		wg.Wait()
 		<-runDone
-		if revision := tx.Revision(); revision != 1 && revision != 2 {
+		if revision := tx.Revision(); revision < 1 || revision > 3 {
 			t.Fatalf("non-atomic close/commit revision %d", revision)
 		}
 		if err := tx.Close(); err != nil {
@@ -696,6 +825,43 @@ func TestTransactionCloseRacesAtomicCommit(t *testing.T) {
 			t.Fatalf("round %d leaked budget: %d", round, ledger.Current())
 		}
 	}
+}
+
+func TestRunnerWaitClosedDrainsProcessorNotJustOneInvocation(t *testing.T) {
+	tx1, _, _ := newTransaction(t, "drain-a", "")
+	tx2, _, _ := newTransaction(t, "drain-b", "")
+	type pending struct {
+		invocation *processor.Invocation
+		completion *processor.Completion
+	}
+	started := make(chan pending, 2)
+	fake := newFake(t, "drain", processor.Requirements{}, func(inv *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		started <- pending{invocation: inv, completion: completion}
+	})
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+	runErrors := make(chan error, 2)
+	for _, tx := range []*model.Transaction{tx1, tx2} {
+		go func(tx *model.Transaction) {
+			_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+			runErrors <- err
+		}(tx)
+	}
+	first, second := <-started, <-started
+	if err := runner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runner.WaitClosed(ctx); err == nil {
+		t.Fatal("WaitClosed treated active executions as drained")
+	}
+	finish(t, first.completion, model.Continue(), nil)
+	finish(t, second.completion, model.Continue(), nil)
+	if err := runner.WaitClosed(context.Background()); err != nil {
+		t.Fatalf("WaitClosed returned before all invocations exited: %v", err)
+	}
+	<-runErrors
+	<-runErrors
 }
 
 func channelOpen(ch <-chan struct{}) bool {
