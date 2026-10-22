@@ -33,15 +33,15 @@ func benchmarkTransaction(b *testing.B, id string, body string) (*model.Transact
 		b.Fatal(err)
 	}
 	request := model.RequestHead{Method: "POST", URL: urlValue, Authority: "example.test", Headers: headers, Trailers: trailers}
-	var bodySlot model.BodySlot
+	var reader io.ReadCloser
 	if body != "" {
-		reader := io.NopCloser(strings.NewReader(body))
-		broker, err := model.NewBodyBroker(context.Background(), model.BodySource{Reader: reader, Owner: model.FrameworkOwned, DeclaredLength: int64(len(body))}, ledger)
-		if err != nil {
-			b.Fatal(err)
-		}
-		bodySlot = model.NewBodySlot(broker)
+		reader = io.NopCloser(strings.NewReader(body))
 	}
+	broker, err := model.NewBodyBroker(context.Background(), model.BodySource{Reader: reader, Owner: model.FrameworkOwned, DeclaredLength: int64(len(body))}, ledger)
+	if err != nil {
+		b.Fatal(err)
+	}
+	bodySlot := model.NewBodySlot(broker)
 	tx, err := model.NewTransaction(context.Background(), model.TransactionOptions{
 		ID: id, Generation: 7, Connection: model.ConnectionView{ID: "conn-benchmark", StreamID: "stream-1"},
 		OriginalIngress: request, Request: request, RequestBody: bodySlot, Ledger: ledger,

@@ -87,10 +87,12 @@ func (c *failingCloser) Close() error { c.closes.Add(1); return c.err }
 func newTransaction(t testing.TB, id, body string) (*model.Transaction, *model.Ledger, *countingBody) {
 	t.Helper()
 	var reader *countingBody
+	declared := int64(0)
 	if body != "" {
 		reader = newCountingBody(body)
+		declared = int64(len(body))
 	}
-	return newTransactionConfigured(t, id, "conn-"+id, "stream-1", reader, int64(len(body)))
+	return newTransactionConfigured(t, id, "conn-"+id, "stream-1", reader, declared)
 }
 
 func newTransactionConfigured(t testing.TB, id, connectionID, streamID string, reader *countingBody, declaredLength int64) (*model.Transaction, *model.Ledger, *countingBody) {
@@ -113,14 +115,15 @@ func newTransactionConfigured(t testing.TB, id, connectionID, streamID string, r
 		t.Fatal(err)
 	}
 	request := model.RequestHead{Method: "POST", URL: urlValue, Authority: "example.test", Headers: headers, Trailers: trailers}
-	var slot model.BodySlot
+	var bodyReader io.ReadCloser
 	if reader != nil {
-		broker, err := model.NewBodyBroker(context.Background(), model.BodySource{Reader: reader, Owner: model.FrameworkOwned, DeclaredLength: declaredLength}, ledger)
-		if err != nil {
-			t.Fatal(err)
-		}
-		slot = model.NewBodySlot(broker)
+		bodyReader = reader
 	}
+	broker, err := model.NewBodyBroker(context.Background(), model.BodySource{Reader: bodyReader, Owner: model.FrameworkOwned, DeclaredLength: declaredLength}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := model.NewBodySlot(broker)
 	tx, err := model.NewTransaction(context.Background(), model.TransactionOptions{
 		ID: id, Generation: 7, Connection: model.ConnectionView{ID: connectionID, StreamID: streamID, Downstream: model.ProtocolInfo{Major: 2, Known: true}},
 		OriginalIngress: request, Request: request, RequestBody: slot, Ledger: ledger,
@@ -585,6 +588,24 @@ func TestBodyRequirementsMatchingPrefixReplayAndReplacement(t *testing.T) {
 			t.Fatalf("Body read failure was masked: error=%v starts=%d", err, fake.starts.Load())
 		}
 	})
+}
+
+func TestRequestBodyCanBeReplacedWhenOriginalSourceIsUnavailable(t *testing.T) {
+	tx, ledger, _ := newTransaction(t, "body-replacement-from-empty", "")
+	replace := newFake(t, "replace-empty-body", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		finish(t, completion, mustRequestChange(t, ledger, model.RequestPatch{Body: model.BodyEdit{Kind: model.BodyReplace, Bytes: []byte("new-body")}}), nil)
+	})
+	observe := newFake(t, "observe-empty-body-replacement", processor.Requirements{Body: model.FullBuffered, MaxBodyBytes: 32}, func(_ *processor.Invocation, completion *processor.Completion, input model.Input) {
+		body, err := input.Body().BytesCopy()
+		if err != nil || string(body) != "new-body" {
+			t.Errorf("replacement Body unavailable to next Processor: %q err=%v", body, err)
+		}
+		finish(t, completion, model.Continue(), nil)
+	})
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: replace, Priority: 1}, {Class: Rewrite, Processor: observe, Priority: 2}}, Options{})
+	if report, err := runner.Run(context.Background(), tx, model.RequestPhase); err != nil || report.Outcome != ContinueUpstream {
+		t.Fatalf("body replacement on Unavailable source failed: report=%+v err=%v", report, err)
+	}
 }
 
 func TestFailOpenRollsBackOnlyCurrentEntryAndFailClosedTerminates(t *testing.T) {
