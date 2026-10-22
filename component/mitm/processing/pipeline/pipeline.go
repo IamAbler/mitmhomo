@@ -374,9 +374,14 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	}
 	if invocation.Key() != key {
 		invocation.Cancel(model.ErrInvalid)
+		// Cancel synchronously fixes LogicalDone even while Finish is blocked
+		// releasing execution resources. Await only observes that logical latch.
+		// If Finish won, we remain the sole result receiver and must discard it.
 		lateResult, _ := invocation.Await(context.Background())
 		_ = lateResult.Release()
-		return model.DoneResult{}, input, nil, true, channelClosed(invocation.ExecutionDone()), model.NewProcessingError(model.ProcessingErrorInvalidOutput, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, model.ErrInvalid)
+		executionDone := channelClosed(invocation.ExecutionDone())
+		cause := joinCleanup(model.ErrInvalid, invocation.CleanupError())
+		return model.DoneResult{}, input, nil, true, executionDone, model.NewProcessingError(model.ProcessingErrorInvalidOutput, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, cause)
 	}
 
 	awaitCtx := ctx
