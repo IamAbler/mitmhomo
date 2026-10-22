@@ -188,6 +188,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r = withInboundBodySource(w, r)
 		stream, err := lease.Transaction()
 		if err != nil {
 			rejectRequest(w, r, http.StatusServiceUnavailable, "connection retired")
