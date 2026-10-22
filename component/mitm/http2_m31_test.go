@@ -22,6 +22,7 @@ import (
 )
 
 type h2Harness struct {
+	raw      net.Conn // test teardown can abort active I/O without TLS close_notify
 	client   *http2.ClientConn
 	wire     http.RoundTripper
 	manager  *Manager
@@ -127,6 +128,7 @@ func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targe
 	}()
 	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", listener.Addr().String())
 	require.NoError(t, err)
+	h.raw = raw
 	clientProtocols := []string{"http/1.1"}
 	if downstreamH2 {
 		clientProtocols = []string{"h2", "http/1.1"}
@@ -138,7 +140,8 @@ func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targe
 	require.NoError(t, err)
 	if downstreamH2 {
 		require.Equal(t, "h2", secure.ConnectionState().NegotiatedProtocol)
-		h.client, err = (&http2.Transport{}).NewClientConn(secure)
+		// Acceptance tests may offer more requests than negotiated stream slots.
+		h.client, err = (&http2.Transport{StrictMaxConcurrentStreams: true}).NewClientConn(secure)
 		require.NoError(t, err)
 		h.wire = h.client
 	} else {

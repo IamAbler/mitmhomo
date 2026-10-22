@@ -22,6 +22,11 @@ import (
 // Wire-level GOAWAY last-stream-id=1 keeps stream 1 alive, rejects POST on
 // stream 3, and forces a later request onto a new native-routed connection.
 func TestM34GoAwayDrainAndNoReplay(t *testing.T) {
+	m34GoAwayDrainAndNoReplay(t)
+}
+
+func m34GoAwayDrainAndNoReplay(t *testing.T) {
+	t.Helper()
 	cert, roots := makeTestUpstreamCertificate(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -142,8 +147,18 @@ func TestM34GoAwayDrainAndNoReplay(t *testing.T) {
 		res.Body.Close()
 	}
 	require.Error(t, err)
-	require.NoError(t, <-serverErrors)
-	require.Equal(t, "ok", <-sibling, "GOAWAY must let stream <= last-stream-id complete")
+	select {
+	case err := <-serverErrors:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		t.Fatal("GOAWAY server did not finish:", ctx.Err())
+	}
+	select {
+	case result := <-sibling:
+		require.Equal(t, "ok", result, "GOAWAY must let stream <= last-stream-id complete")
+	case <-ctx.Done():
+		t.Fatal("GOAWAY sibling did not finish:", ctx.Err())
+	}
 	require.EqualValues(t, 1, accepts.Load(), "failed POST was not redialed/replayed")
 	req, _ = http.NewRequestWithContext(ctx, "GET", "https://localhost/after", nil)
 	res, err = rt.RoundTrip(req)
