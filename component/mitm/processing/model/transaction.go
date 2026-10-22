@@ -221,6 +221,9 @@ func NewTransaction(parent context.Context, options TransactionOptions) (*Transa
 		return nil, err
 	}
 	success = true
+	if b := t.requestBody.broker; b != nil {
+		b.attachContext(ctx)
+	}
 	return t, nil
 }
 
@@ -335,6 +338,9 @@ func (t *Transaction) EnterResponse(expected Revision, original, entry ResponseH
 	t.originalResponse, t.phaseResponse, t.response = orig, phaseResponse, work
 	t.phaseRequest = phaseRequest
 	t.responseBody = body
+	if body.broker != nil {
+		body.broker.attachContext(t.ctx)
+	}
 	t.origin = origin
 	t.phase = ResponsePhase
 	t.revision++
@@ -376,41 +382,78 @@ func (t *Transaction) bodyLocked() *BodyBroker {
 	return t.requestBody.broker
 }
 func (t *Transaction) PrepareBody(need BodyNeed, limit int64) error {
+	return t.PrepareBodyContext(t.ctx, need, limit)
+}
+func (t *Transaction) BodyExecutionDone() <-chan struct{} {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.check(t.revision); err != nil {
-		return err
-	}
-	if t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted || t.phase == RequestPhase && t.outcome == ExchangeUpstreamIssued {
-		return ErrClosed
+	return NewBodySlot(t.bodyLocked()).ExecutionDone()
+}
+
+// PrepareBodyContext transfers optional execution pins to the Body owner. Pins
+// survive logical timeout and are released only after physical Body disposal.
+func (t *Transaction) PrepareBodyContext(ctx context.Context, need BodyNeed, limit int64, resources ...io.Closer) error {
+	t.mu.Lock()
+	revision := t.revision
+	err := t.check(revision)
+	if err == nil && (t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted || t.phase == RequestPhase && t.outcome == ExchangeUpstreamIssued) {
+		err = ErrClosed
 	}
 	b := t.bodyLocked()
+	t.mu.Unlock()
+	if err != nil {
+		closeBodyResources(resources)
+		return err
+	}
 	if b == nil {
+		closeBodyResources(resources)
 		if need == None {
 			return nil
 		}
 		return ErrBodyUnavailable
 	}
-	return b.Prepare(t.ctx, need, limit)
+	return b.prepare(ctx, need, limit, func(publish func() error) error {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err := t.check(revision); err != nil {
+			return err
+		}
+		if t.bodyLocked() != b {
+			return ErrStaleRevision
+		}
+		return publish()
+	}, resources)
 }
+
 func (t *Transaction) ReplaceBody(expected Revision, data []byte) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if err := t.check(expected); err != nil {
-		return err
-	}
-	if t.outcome != ExchangePending && !(t.phase == ResponsePhase && t.outcome == ExchangeUpstreamIssued) {
-		return ErrClosed
+	err := t.check(expected)
+	if err == nil && t.outcome != ExchangePending && !(t.phase == ResponsePhase && t.outcome == ExchangeUpstreamIssued) {
+		err = ErrClosed
 	}
 	b := t.bodyLocked()
+	t.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	if b == nil {
 		return ErrBodyUnavailable
 	}
-	if err := b.Replace(t.ctx, data); err != nil {
-		return err
-	}
-	t.revision++
-	return nil
+	return b.replace(t.ctx, data, func(publish func() error) error {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err := t.check(expected); err != nil {
+			return err
+		}
+		if t.bodyLocked() != b {
+			return ErrStaleRevision
+		}
+		if err := publish(); err != nil {
+			return err
+		}
+		t.revision++
+		return nil
+	})
 }
 func (t *Transaction) TakeBody() (io.ReadCloser, error) {
 	t.mu.Lock()
@@ -440,18 +483,23 @@ func (t *Transaction) Terminate(cause error) {
 			t.outcome = ExchangeAborted
 		}
 	}
+	requestBody, responseBody := t.requestBody.broker, t.responseBody.broker
 	t.mu.Unlock()
+	if requestBody != nil {
+		requestBody.CancelRead(cause)
+	}
+	if responseBody != nil {
+		responseBody.CancelRead(cause)
+	}
 }
-func (t *Transaction) Close() error {
+func (t *Transaction) CloseLogical() {
 	if t == nil {
-		return nil
+		return
 	}
 	t.cancel(context.Canceled)
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.state != Closed {
 		t.state = Closed
-		t.closeErr = errors.Join(t.requestBody.Close(), t.responseBody.Close())
 		if t.hasSynthetic {
 			t.closeErr = errors.Join(t.closeErr, t.synthetic.Release())
 			t.hasSynthetic = false
@@ -468,8 +516,35 @@ func (t *Transaction) Close() error {
 		t.decisionReason = ""
 		t.currentInvocation = ""
 	}
-	return t.closeErr
+	requestBody, responseBody := t.requestBody.broker, t.responseBody.broker
+	t.mu.Unlock()
+	if requestBody != nil {
+		requestBody.CloseLogical()
+	}
+	if responseBody != nil {
+		responseBody.CloseLogical()
+	}
 }
+
+// CloseContext bounds the caller wait, without discarding an in-flight source.
+func (t *Transaction) CloseContext(ctx context.Context) error {
+	if t == nil {
+		return nil
+	}
+	t.CloseLogical()
+	t.mu.Lock()
+	requestBody, responseBody := t.requestBody.broker, t.responseBody.broker
+	err := t.closeErr
+	t.mu.Unlock()
+	if requestBody != nil {
+		err = errors.Join(err, requestBody.CloseContext(ctx))
+	}
+	if responseBody != nil {
+		err = errors.Join(err, responseBody.CloseContext(ctx))
+	}
+	return err
+}
+func (t *Transaction) Close() error { return t.CloseContext(context.Background()) }
 
 // Input has only detached values and private immutable allocations. Its copy
 // lease is returned separately to the owner, never through this input API.

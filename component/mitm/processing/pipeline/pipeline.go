@@ -159,7 +159,7 @@ func (r *Runner) Run(ctx context.Context, tx *model.Transaction, phase model.Pha
 	defer permit.Release()
 	// Observe cancellation and an existing BodyBroker fault without consuming
 	// the real source. FullBuffered still waits until after metadata selection.
-	if err := tx.PrepareBody(model.None, 0); err != nil {
+	if err := tx.PrepareBodyContext(ctx, model.None, 0); err != nil {
 		return r.terminate(tx, report, classifyBody(err, phase, "", ""))
 	}
 
@@ -294,9 +294,22 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	if key.Phase == model.ResponsePhase {
 		requirements = descriptor.ResponseNeeds
 	}
-	if err := tx.PrepareBody(requirements.Body, requirements.MaxBodyBytes); err != nil {
+	var bodyResources []io.Closer
+	if requirements.Body == model.FullBuffered && r.options.AcquireGeneration != nil {
+		pin, err := r.options.AcquireGeneration(ctx, key.Generation)
+		if err != nil {
+			_ = inputLease.Close()
+			return model.DoneResult{}, input, nil, false, true, classify(err, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginConnection)
+		}
+		if pin == nil {
+			_ = inputLease.Close()
+			return model.DoneResult{}, input, nil, false, true, classify(model.ErrInvalid, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginConnection)
+		}
+		bodyResources = append(bodyResources, pin)
+	}
+	if err := tx.PrepareBodyContext(ctx, requirements.Body, requirements.MaxBodyBytes, bodyResources...); err != nil {
 		_ = inputLease.Close()
-		return model.DoneResult{}, input, nil, false, true, classifyBody(err, key.Phase, descriptor.ID, key.Invocation)
+		return model.DoneResult{}, input, nil, false, channelClosed(tx.BodyExecutionDone()), classifyBody(err, key.Phase, descriptor.ID, key.Invocation)
 	}
 	if requirements.Body == model.FullBuffered {
 		_ = inputLease.Close()

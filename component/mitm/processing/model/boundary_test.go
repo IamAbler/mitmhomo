@@ -19,6 +19,7 @@ func TestModelDependencyBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var bodyLaunches int
 	for _, entry := range entries {
 		if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
@@ -35,10 +36,18 @@ func TestModelDependencyBoundary(t *testing.T) {
 		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			if _, ok := node.(*ast.GoStmt); ok {
-				t.Errorf("model starts a goroutine: %s", entry.Name())
+				// M4.9 Body fix: only the admitted source operation owner may
+				// launch work. Capacity and late release are tested at runtime.
+				if entry.Name() != "body_operation.go" {
+					t.Errorf("model starts an unowned goroutine: %s", entry.Name())
+				}
+				bodyLaunches++
 			}
 			return true
 		})
+	}
+	if bodyLaunches != 3 {
+		t.Fatalf("Body launch sites changed: %d", bodyLaunches)
 	}
 	// The processor, pipeline and generation layers are intentional production
 	// dependencies on the model. No protocol, engine, or existing production

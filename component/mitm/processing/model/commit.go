@@ -191,10 +191,18 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 				lease.Close()
 				return ResultInvalid, ErrBodyUnavailable
 			}
-			if err := broker.Replace(t.ctx, patch.Body.Bytes); err != nil {
+			err := t.replaceForCommit(input, broker, patch.Body.Bytes, func() {
+				old := t.requestLease
+				t.request, t.requestLease = head, lease
+				t.revision++
+				t.currentInvocation = ""
+				old.Close()
+			})
+			if err != nil {
 				lease.Close()
 				return ResultInvalid, err
 			}
+			return ResultRequestChange, nil
 		}
 		old := t.requestLease
 		t.request, t.requestLease = head, lease
@@ -216,10 +224,18 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 				lease.Close()
 				return ResultInvalid, ErrBodyUnavailable
 			}
-			if err := broker.Replace(t.ctx, patch.Body.Bytes); err != nil {
+			err := t.replaceForCommit(input, broker, patch.Body.Bytes, func() {
+				old := t.responseLease
+				t.response, t.responseLease = head, lease
+				t.revision++
+				t.currentInvocation = ""
+				old.Close()
+			})
+			if err != nil {
 				lease.Close()
 				return ResultInvalid, err
 			}
+			return ResultResponseChange, nil
 		}
 		old := t.responseLease
 		t.response, t.responseLease = head, lease
@@ -436,4 +452,33 @@ func (s SyntheticResponse) cloneTo(ledger *Ledger) (SyntheticResponse, error) {
 		return SyntheticResponse{}, err
 	}
 	return SyntheticResponse{payload: &syntheticPayload{status: s.payload.status, headers: headers, body: body, trailers: trailers, storage: storage}}, nil
+}
+
+// replaceForCommit preserves atomic Head/Body publication while the source's
+// Read/Close and logical waiting happen outside the Transaction state lock.
+// The caller holds mu on entry and again on return.
+func (t *Transaction) replaceForCommit(input Input, broker *BodyBroker, data []byte, apply func()) error {
+	committed := false
+	t.mu.Unlock()
+	err := broker.replace(t.ctx, data, func(publish func() error) error {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err := t.check(input.key.Revision); err != nil {
+			return err
+		}
+		if t.bodyLocked() != broker || t.currentInvocation != input.key.Invocation || t.phase != input.key.Phase {
+			return ErrStaleRevision
+		}
+		if err := publish(); err != nil {
+			return err
+		}
+		apply()
+		committed = true
+		return nil
+	})
+	t.mu.Lock()
+	if committed {
+		return nil
+	}
+	return err
 }
