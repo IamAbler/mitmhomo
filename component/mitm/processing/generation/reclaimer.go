@@ -12,9 +12,13 @@ var ErrCleanupCapacity = errors.New("generation cleanup ownership capacity exhau
 // resource construction; a blocked destructor retains its slot until real exit.
 // This is a lifecycle ownership bound, not Processor execution scheduling.
 type CleanupPool struct {
-	slots   chan struct{}
-	mu      sync.Mutex
-	changed chan struct{}
+	slots     chan struct{}
+	mu        sync.Mutex
+	changed   chan struct{}
+	cleaning  int
+	rejected  uint64
+	failures  uint64
+	lastError error
 }
 
 func NewCleanupPool(capacity int) *CleanupPool {
@@ -40,6 +44,7 @@ func (p *CleanupPool) Reserve() (*CleanupReservation, error) {
 	case p.slots <- struct{}{}:
 		return &CleanupReservation{pool: p}, nil
 	default:
+		p.rejected++
 		return nil, ErrCleanupCapacity
 	}
 }
@@ -63,10 +68,42 @@ func (r *CleanupReservation) Attach(g *Generation) error {
 		return ErrUnavailable
 	}
 	r.attached = true
-	g.dispatchCleanup = func(cleanup func()) { go func() { defer r.pool.release(); cleanup() }() }
+	g.dispatchCleanup = func(cleanup func()) {
+		r.pool.mu.Lock()
+		r.pool.cleaning++
+		r.pool.mu.Unlock()
+		go func() {
+			defer func() {
+				r.pool.mu.Lock()
+				r.pool.cleaning--
+				if err := g.CloseError(); err != nil {
+					r.pool.failures++
+					r.pool.lastError = err
+				}
+				r.pool.mu.Unlock()
+				r.pool.release()
+			}()
+			cleanup()
+		}()
+	}
 	return nil
 }
 func (p *CleanupPool) Outstanding() int { return len(p.slots) }
+
+// CleanupStats is a bounded snapshot, without request data or per-generation
+// metric labels. Occupied includes live generations, not just cleanup workers.
+// Cleaning includes a blocked destructor or observer until its actual return.
+type CleanupStats struct {
+	Capacity, Occupied, Cleaning int
+	Rejected, Failures           uint64
+	LastError                    error
+}
+
+func (p *CleanupPool) Stats() CleanupStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return CleanupStats{cap(p.slots), len(p.slots), p.cleaning, p.rejected, p.failures, p.lastError}
+}
 
 func (p *CleanupPool) release() {
 	p.mu.Lock()
