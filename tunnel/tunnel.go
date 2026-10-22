@@ -69,6 +69,7 @@ var (
 	snifferDispatcher *sniffer.Dispatcher
 	sniffingEnable    = false
 	mitmDispatcher    stdatomic.Pointer[mitm.Manager]
+	mitmPublishMu     sync.Mutex
 
 	ruleUpdateCallback = utils.NewCallback[P.RuleProvider]()
 )
@@ -88,7 +89,12 @@ func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
 // UpdateMITMManager atomically publishes the active optional dispatcher.
 // A nil manager disables MITM without adding reads to native TCP handling.
 func UpdateMITMManager(manager *mitm.Manager) {
-	mitmDispatcher.Store(manager)
+	mitmPublishMu.Lock()
+	old := mitmDispatcher.Swap(manager)
+	mitmPublishMu.Unlock()
+	if old != nil && old != manager {
+		_ = old.Close()
+	}
 }
 
 // DialTCP reuses Mihomo's native metadata preprocessing, rule selection,
@@ -707,8 +713,19 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
+	mitmPublishMu.Lock()
 	manager := mitmDispatcher.Load()
-	mitmCheckMetadata, mitmShouldInspect := snapshotMITMMetadata(manager, metadata)
+	var binding *mitm.Connection
+	if manager != nil {
+		binding = manager.Bind(metadata.DstPort)
+	}
+	mitmPublishMu.Unlock()
+	defer binding.Close()
+	mitmShouldInspect := binding != nil
+	var mitmCheckMetadata *C.Metadata
+	if mitmShouldInspect {
+		mitmCheckMetadata = metadata.Clone()
+	}
 
 	preHandleFailed := false
 	if err := preHandleMetadata(metadata); err != nil {
@@ -732,7 +749,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	}
 
 	if mitmShouldInspect {
-		outcome, mitmErr := manager.Dispatch(context.Background(), conn, mitmCheckMetadata, func(hello *sniffer.TLSClientHelloInfo) (*C.Metadata, error) {
+		outcome, mitmErr := binding.Dispatch(context.Background(), conn, mitmCheckMetadata, func(hello *sniffer.TLSClientHelloInfo) (*C.Metadata, error) {
 			return prepareMITMOrigin(metadata, hello)
 		}, Tunnel.DialTCPWithTLSHandshake)
 		if mitmErr != nil {

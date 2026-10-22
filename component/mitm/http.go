@@ -21,6 +21,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/mitm/httphook"
+	"github.com/metacubex/mihomo/component/mitm/processing/generation"
 	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
@@ -64,8 +65,12 @@ type ResponseHook func(*http.Response) error
 // can continue. DispatchFailed means the SNI matched but the connection could
 // not be prepared or served; callers must not resume native ciphertext relay.
 func (m *Manager) Dispatch(ctx context.Context, conn *N.BufferedConn, metadata *C.Metadata, prepare MetadataPreparer, dial NativeDialContext) (outcome DispatchOutcome, err error) {
-	snapshot, releaseSnapshot := m.acquireSnapshot()
+	snapshot, lease, releaseSnapshot := m.acquireConnectionSnapshot()
 	defer releaseSnapshot()
+	return m.dispatchSnapshot(ctx, conn, metadata, prepare, dial, snapshot, lease)
+}
+
+func (m *Manager) dispatchSnapshot(ctx context.Context, conn *N.BufferedConn, metadata *C.Metadata, prepare MetadataPreparer, dial NativeDialContext, snapshot *configSnapshot, lease *generation.Lease) (outcome DispatchOutcome, err error) {
 	if snapshot == nil || !snapshot.config.Enabled || metadata == nil || !portAllowed(snapshot, metadata.DstPort) {
 		return DispatchUnmatched, nil
 	}
@@ -87,7 +92,7 @@ func (m *Manager) Dispatch(ctx context.Context, conn *N.BufferedConn, metadata *
 			return failedDispatch(conn, fmt.Errorf("prepare MITM origin Metadata: %w", err))
 		}
 	}
-	if err := m.serveTLSConnection(ctx, conn, origin, hello, dial, snapshot); err != nil {
+	if err := m.serveTLSConnection(ctx, conn, origin, hello, dial, snapshot, lease); err != nil {
 		return failedDispatch(conn, err)
 	}
 	return DispatchIntercepted, nil
@@ -112,7 +117,7 @@ func sameRequestBody(a, b io.ReadCloser) bool {
 	return valueA.Interface() == valueB.Interface()
 }
 
-func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadata *C.Metadata, hello *sniffer.TLSClientHelloInfo, dial NativeDialContext, snapshot *configSnapshot) error {
+func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadata *C.Metadata, hello *sniffer.TLSClientHelloInfo, dial NativeDialContext, snapshot *configSnapshot, lease *generation.Lease) error {
 	if conn == nil || metadata == nil || hello == nil {
 		return errors.New("incomplete MITM connection state")
 	}
@@ -183,6 +188,12 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stream, err := lease.Transaction()
+		if err != nil {
+			rejectRequest(w, r, http.StatusServiceUnavailable, "connection retired")
+			return
+		}
+		defer stream.Close()
 		if !(r.ProtoMajor == 1 && r.ProtoMinor == 1 || r.ProtoMajor == 2 && tlsConn.ConnectionState().NegotiatedProtocol == "h2") {
 			rejectRequest(w, r, http.StatusHTTPVersionNotSupported, "HTTP/1.1 or negotiated HTTP/2 is required")
 			return

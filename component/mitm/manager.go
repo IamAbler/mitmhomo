@@ -13,6 +13,7 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/mitm/httphook"
+	"github.com/metacubex/mihomo/component/mitm/processing/generation"
 	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
@@ -56,6 +57,7 @@ type Config struct {
 }
 
 type configSnapshot struct {
+	generation   *generation.Generation
 	config       Config
 	ports        map[uint16]struct{}
 	portRanges   []PortRange
@@ -69,7 +71,10 @@ type configSnapshot struct {
 // Manager publishes immutable configuration snapshots. A nil or disabled
 // snapshot makes ShouldInspect return without touching the connection.
 type Manager struct {
-	snapshot atomic.Pointer[configSnapshot]
+	mu                sync.Mutex
+	closed            bool
+	retiredGeneration *generation.Generation
+	snapshot          atomic.Pointer[configSnapshot]
 }
 
 func NewManager(config Config) *Manager {
@@ -78,8 +83,24 @@ func NewManager(config Config) *Manager {
 	return manager
 }
 
+// BuildManager validates a production candidate before any configuration is
+// applied. NewManager remains available for parser and protocol fixtures that
+// deliberately exercise an absent CA. All fallible parsing/compilation occurs
+// in config.Parse before this constructor; Snapshot cloning is infallible.
+func BuildManager(config Config) (*Manager, error) {
+	if config.Enabled && (config.CA == nil || config.CA.signer == nil || config.CA.leaf == nil) {
+		return nil, errors.New("MITM candidate requires a validated CA")
+	}
+	return NewManager(config), nil
+}
+
 func (m *Manager) Update(config Config) {
 	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
 		return
 	}
 	snapshot := &configSnapshot{
@@ -124,6 +145,8 @@ func (m *Manager) Update(config Config) {
 		}
 	}
 	snapshot.refs.Store(1) // Manager ownership, released on the next Update.
+	snapshot.generation = generation.New(snapshot.config.ScriptHooks)
+	_ = snapshot.generation.Activate()
 	previous := m.snapshot.Swap(snapshot)
 	if previous != nil {
 		previous.retire()
@@ -137,44 +160,18 @@ func cloneScriptHooks(enabled bool, hooks *httphook.Snapshot, services httphook.
 	return hooks.CloneWithServices(services)
 }
 
-func (s *configSnapshot) tryAcquire() bool {
-	if s == nil {
-		return false
-	}
-	for {
-		if s.retired.Load() {
-			return false
-		}
-		refs := s.refs.Load()
-		if refs <= 0 {
-			return false
-		}
-		if !s.refs.CompareAndSwap(refs, refs+1) {
-			continue
-		}
-		if !s.retired.Load() {
-			return true
-		}
-		s.release()
-		return false
-	}
-}
-
 func (s *configSnapshot) release() {
 	if s == nil {
 		return
 	}
 	if s.refs.Add(-1) == 0 {
-		s.closeOnce.Do(func() {
-			if s.config.ScriptHooks != nil {
-				_ = s.config.ScriptHooks.Close()
-			}
-		})
+		s.closeOnce.Do(func() {})
 	}
 }
 
 func (s *configSnapshot) retire() {
 	if s != nil && s.retired.CompareAndSwap(false, true) {
+		s.generation.Retire()
 		s.release() // Manager ownership.
 	}
 }
@@ -187,7 +184,8 @@ func (m *Manager) ConfigSnapshot() Config {
 	if m == nil {
 		return Config{}
 	}
-	snapshot := m.snapshot.Load()
+	snapshot, release := m.acquireSnapshot()
+	defer release()
 	if snapshot == nil {
 		return Config{}
 	}
@@ -235,18 +233,66 @@ func (m *Manager) loadSnapshot() *configSnapshot {
 }
 
 func (m *Manager) acquireSnapshot() (*configSnapshot, func()) {
+	s, _, release := m.acquireConnectionSnapshot()
+	return s, release
+}
+
+func (m *Manager) acquireConnectionSnapshot() (*configSnapshot, *generation.Lease, func()) {
 	if m == nil {
-		return nil, func() {}
+		return nil, nil, func() {}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, nil, func() {}
 	}
 	for {
 		snapshot := m.snapshot.Load()
 		if snapshot == nil {
-			return nil, func() {}
+			return nil, nil, func() {}
 		}
-		if snapshot.tryAcquire() {
-			return snapshot, snapshot.release
+		lease, err := snapshot.generation.Bind()
+		if err == nil {
+			snapshot.refs.Add(1)
+			var once sync.Once
+			return snapshot, lease, func() { once.Do(func() { snapshot.release(); _ = lease.Close() }) }
 		}
+		return nil, nil, func() {}
 	}
+}
+
+// Close permanently retires the manager. Connection owners keep their fixed
+// snapshot alive until Dispatch returns; new Dispatch calls are rejected.
+func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed = true
+	snapshot := m.snapshot.Swap(nil)
+	if snapshot != nil {
+		m.retiredGeneration = snapshot.generation
+	}
+	m.mu.Unlock()
+	if snapshot != nil {
+		snapshot.retire()
+		return snapshot.generation.CloseError()
+	}
+	return nil
+}
+
+// Generation returns lifecycle diagnostics, never a connection admission path.
+func (m *Manager) Generation() *generation.Generation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s := m.snapshot.Load(); s != nil {
+		return s.generation
+	}
+	return m.retiredGeneration
 }
 
 // InspectClientHello only reads when the manager is enabled for this port.
