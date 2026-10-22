@@ -91,7 +91,12 @@ func BuildManager(config Config) (*Manager, error) {
 	if config.Enabled && (config.CA == nil || config.CA.signer == nil || config.CA.leaf == nil) {
 		return nil, errors.New("MITM candidate requires a validated CA")
 	}
-	return NewManager(config), nil
+	manager := NewManager(config)
+	if err := manager.snapshot.Load().config.ScriptHooks.Prepare(); err != nil {
+		_ = manager.Close()
+		return nil, err
+	}
+	return manager, nil
 }
 
 func (m *Manager) Update(config Config) {

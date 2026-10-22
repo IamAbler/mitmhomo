@@ -5,7 +5,10 @@ import (
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/log"
+	"sync"
 )
+
+var applyMu sync.Mutex
 
 type Option func(*config.Config)
 
@@ -52,9 +55,14 @@ func WithSecret(secret string) Option {
 }
 
 // ApplyConfig dispatch configure to all parts include ExternalController
-func ApplyConfig(cfg *config.Config) {
+func ApplyConfig(cfg *config.Config) error {
+	applyMu.Lock()
+	defer applyMu.Unlock()
+	if err := executor.ApplyConfig(cfg, true); err != nil {
+		return err
+	}
 	applyRoute(cfg)
-	executor.ApplyConfig(cfg, true)
+	return nil
 }
 
 func applyRoute(cfg *config.Config) {
@@ -101,6 +109,5 @@ func Parse(configBytes []byte, options ...Option) error {
 		option(cfg)
 	}
 
-	ApplyConfig(cfg)
-	return nil
+	return ApplyConfig(cfg)
 }

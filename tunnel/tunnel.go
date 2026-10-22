@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/mitm"
+	"github.com/metacubex/mihomo/component/mitm/processing/generation"
 	"github.com/metacubex/mihomo/component/nat"
 	"github.com/metacubex/mihomo/component/process"
 	"github.com/metacubex/mihomo/component/proxydialer"
@@ -95,6 +96,18 @@ func UpdateMITMManager(manager *mitm.Manager) {
 	if old != nil && old != manager {
 		_ = old.Close()
 	}
+}
+
+// MITMGeneration exposes immutable lifecycle diagnostics for the current
+// manager. Connection admission must go through the publisher's Bind path.
+func MITMGeneration() *generation.Generation {
+	mitmPublishMu.Lock()
+	defer mitmPublishMu.Unlock()
+	manager := mitmDispatcher.Load()
+	if manager == nil {
+		return nil
+	}
+	return manager.Generation()
 }
 
 // DialTCP reuses Mihomo's native metadata preprocessing, rule selection,

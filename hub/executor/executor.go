@@ -82,9 +82,22 @@ func ParseWithBytes(buf []byte) (*config.Config, error) {
 }
 
 // ApplyConfig dispatch configure to all parts without ExternalController
-func ApplyConfig(cfg *config.Config, force bool) {
+func ApplyConfig(cfg *config.Config, force bool) error {
 	mux.Lock()
 	defer mux.Unlock()
+	var candidate *mitm.Manager
+	if cfg == nil {
+		return fmt.Errorf("nil configuration")
+	}
+	if cfg.MITM != nil && cfg.MITM.Enabled {
+		candidateConfig := *cfg.MITM
+		candidateConfig.ScriptServices.HTTPClients = tunnel.ScriptHTTPClientFactory
+		var err error
+		candidate, err = mitm.BuildManager(candidateConfig)
+		if err != nil {
+			return fmt.Errorf("build MITM candidate: %w", err)
+		}
+	}
 	log.SetLevel(cfg.General.LogLevel)
 
 	tunnel.OnSuspend()
@@ -100,7 +113,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUsers(cfg.Users)
 	updateProxies(cfg.Proxies, cfg.Providers)
 	updateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
-	updateMITM(cfg.MITM)
+	tunnel.UpdateMITMManager(candidate)
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
@@ -122,6 +135,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUpdater(cfg)
 
 	resolver.ResetConnection()
+	return nil
 }
 
 func initInnerTcp() {
@@ -367,17 +381,6 @@ func updateSniffer(snifferConfig *sniffer.Config) {
 	} else {
 		log.Infoln("Sniffer is closed")
 	}
-}
-
-func updateMITM(mitmConfig *mitm.Config) {
-	if mitmConfig == nil || !mitmConfig.Enabled {
-		tunnel.UpdateMITMManager(nil)
-		log.Infoln("HTTPS MITM is closed")
-		return
-	}
-	mitmConfig.ScriptServices.HTTPClients = tunnel.ScriptHTTPClientFactory
-	tunnel.UpdateMITMManager(mitm.NewManager(*mitmConfig))
-	log.Infoln("HTTPS MITM is loaded and working")
 }
 
 func updateTunnels(tunnels []LC.Tunnel) {

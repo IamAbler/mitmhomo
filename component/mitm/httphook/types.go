@@ -244,6 +244,25 @@ func (s *Snapshot) Close() error {
 	return nil
 }
 
+// Prepare validates all programs on the unpublished candidate. It creates no
+// VM and executes no user code. Legacy fixture constructors may stay lazy;
+// production publication must call Prepare and close the candidate on error.
+func (s *Snapshot) Prepare() error {
+	if s == nil {
+		return nil
+	}
+	runtime, err := s.getRuntime()
+	if err != nil {
+		return err
+	}
+	for _, rule := range s.rules {
+		if _, err := runtime.Compile(rule.source); err != nil {
+			return fmt.Errorf("prepare HTTP script %q: %w", rule.name, err)
+		}
+	}
+	return nil
+}
+
 // RuntimeInitialized reports whether a matching rule has caused lazy Runtime
 // construction. It is also useful for lifecycle diagnostics.
 func (s *Snapshot) RuntimeInitialized() bool {
