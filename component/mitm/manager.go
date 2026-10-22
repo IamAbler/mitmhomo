@@ -41,6 +41,7 @@ type Config struct {
 	// Each call transfers fresh, exclusively owned processors, including any
 	// partial result on error. Nil means the existing legacy-only HTTP path.
 	ProcessorFactory   func() ([]pipeline.Entry, error)
+	cleanupPool        *generation.CleanupPool // test seam; production uses bounded default
 	Enabled            bool
 	Ports              []uint16
 	PortRanges         []PortRange
@@ -95,11 +96,15 @@ func NewManager(config Config) *Manager {
 // deliberately exercise an absent CA. Parsing precedes this constructor;
 // processor initialization and script preparation finish before activation.
 func BuildManager(config Config) (*Manager, error) {
+	return BuildManagerContext(context.Background(), config)
+}
+
+func BuildManagerContext(ctx context.Context, config Config) (*Manager, error) {
 	if config.Enabled && (config.CA == nil || config.CA.signer == nil || config.CA.leaf == nil) {
 		return nil, errors.New("MITM candidate requires a validated CA")
 	}
 	manager := &Manager{}
-	if err := manager.update(config, true); err != nil {
+	if err := manager.updateContext(ctx, config, true); err != nil {
 		return nil, err
 	}
 	return manager, nil
@@ -108,15 +113,38 @@ func BuildManager(config Config) (*Manager, error) {
 func (m *Manager) Update(config Config) error { return m.update(config, false) }
 
 func (m *Manager) update(config Config, prepare bool) error {
+	return m.updateContext(context.Background(), config, prepare)
+}
+
+func (m *Manager) UpdateContext(ctx context.Context, config Config) error {
+	return m.updateContext(ctx, config, false)
+}
+
+func (m *Manager) updateContext(ctx context.Context, config Config, prepare bool) error {
 	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
-	// Defer unlock before running the elected retirement continuation.
-	cleanup := func() {}
-	defer func() { m.mu.Unlock(); cleanup() }()
-	if m.closed {
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
 		return generation.ErrUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
+	var reservation *generation.CleanupReservation
+	if prepare || config.ProcessorFactory != nil {
+		pool := config.cleanupPool
+		if pool == nil {
+			pool = generation.DefaultCleanupPool
+		}
+		var err error
+		reservation, err = pool.Reserve()
+		if err != nil {
+			return err
+		}
+		defer reservation.Release()
 	}
 	snapshot := &configSnapshot{
 		config: Config{
@@ -164,17 +192,15 @@ func (m *Manager) update(config Config, prepare bool) error {
 		var err error
 		entries, err = config.ProcessorFactory()
 		if err != nil {
-			for _, entry := range entries {
-				if entry.Processor != nil {
-					err = errors.Join(err, entry.Processor.Close())
-					err = errors.Join(err, entry.Processor.WaitClosed(context.Background()))
-				}
-			}
-			return errors.Join(err, snapshot.config.ScriptHooks.Close())
+			return failCandidate(ctx, generation.FailedBuild(err, entries, snapshot.config.ScriptHooks), reservation)
 		}
 	}
 	plan, err := generation.NewPlan(entries, snapshot.config.ScriptHooks)
 	if err != nil {
+		var failed *generation.BuildError
+		if errors.As(err, &failed) {
+			return failCandidate(ctx, failed, reservation)
+		}
 		return err
 	}
 	snapshot.plan = plan
@@ -186,16 +212,58 @@ func (m *Manager) update(config Config, prepare bool) error {
 	})
 	if prepare {
 		if err := snapshot.config.ScriptHooks.Prepare(); err != nil {
-			return errors.Join(err, snapshot.generation.Close())
+			return failCandidate(ctx, &generation.BuildError{Cause: err, Pending: snapshot.generation}, reservation)
+		}
+	}
+	m.mu.Lock()
+	if m.closed || ctx.Err() != nil {
+		m.mu.Unlock()
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = generation.ErrUnavailable
+		}
+		return failCandidate(ctx, &generation.BuildError{Cause: cause, Pending: snapshot.generation}, reservation)
+	}
+	if reservation != nil {
+		if err := reservation.Attach(snapshot.generation); err != nil {
+			m.mu.Unlock()
+			return &generation.BuildError{Cause: err, Pending: snapshot.generation}
 		}
 	}
 	snapshot.refs.Store(1) // Manager ownership, released on the next Update.
 	_ = snapshot.generation.Activate()
 	previous := m.snapshot.Swap(snapshot)
+	cleanup := func() {}
 	if previous != nil {
 		cleanup = previous.retireDeferred()
 	}
+	m.mu.Unlock()
+	cleanup()
 	return nil
+}
+
+// A failed candidate remains owned by its bounded reservation after the caller
+// stops waiting. No destructor or backend drain runs on the Apply/Bind thread.
+func failCandidate(ctx context.Context, failed *generation.BuildError, reservation *generation.CleanupReservation) error {
+	g := failed.Pending
+	_ = g.ObserveCleanup(func(err error) {
+		if err != nil {
+			log.Warnln("[MITM] failed candidate %d cleanup: %v", g.ID(), err)
+		}
+	})
+	if reservation == nil {
+		// Only the unprepared, factory-free compatibility path can reach
+		// here: no Processor, VM or runtime was created. Its empty Runner
+		// and freshly cloned hooks (runtime=nil) have bounded Close/drain.
+		return errors.Join(failed, g.Close())
+	}
+	if err := reservation.Attach(g); err != nil {
+		return errors.Join(failed, err)
+	}
+	g.Retire()
+	wait, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	return errors.Join(failed, g.WaitClosed(wait))
 }
 
 func cloneScriptHooks(enabled bool, hooks *httphook.Snapshot, services httphook.Services) *httphook.Snapshot {

@@ -36,7 +36,7 @@ type Generation struct {
 	done                                  chan struct{}
 	err                                   error
 	observer                              func(error)
-	dispatchCleanup func(func())
+	dispatchCleanup                       func(func())
 }
 
 func New(resources ...io.Closer) *Generation {
@@ -127,7 +127,11 @@ func (g *Generation) cleanup() {
 }
 
 func (g *Generation) runCleanup() {
-	if g.dispatchCleanup!=nil {g.dispatchCleanup(g.cleanup)} else {g.cleanup()}
+	if g.dispatchCleanup != nil {
+		g.dispatchCleanup(g.cleanup)
+	} else {
+		g.cleanup()
+	}
 }
 
 // Lease is a capability. Child admission and parent Close share the same lock,

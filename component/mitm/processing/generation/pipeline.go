@@ -7,6 +7,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/mitm/processing/model"
 	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
+	"github.com/metacubex/mihomo/component/mitm/processing/processor"
 )
 
 // Plan owns a fixed processor configuration. The caller transfers processor
@@ -29,25 +30,51 @@ func (p planResources) Close() error {
 	return errors.Join(p.runner.Close(), p.runner.WaitClosed(context.Background()))
 }
 
+// BuildError retains exclusive ownership of ALL partial resources. Returning
+// it never calls a potentially blocking Close. The receiver must arrange
+// cleanup of Pending (or attach a pre-reserved cleanup owner), then WaitClosed.
+type BuildError struct {
+	Cause   error
+	Pending *Generation
+}
+
+func (e *BuildError) Error() string { return e.Cause.Error() }
+func (e *BuildError) Unwrap() error { return e.Cause }
+
+type partialProcessors struct{ processors []processor.Processor }
+
+func (p partialProcessors) Close() error {
+	var err error
+	for _, backend := range p.processors {
+		err = errors.Join(err, backend.Close())
+	}
+	for _, backend := range p.processors {
+		err = errors.Join(err, backend.WaitClosed(context.Background()))
+	}
+	return err
+}
+func FailedBuild(cause error, entries []pipeline.Entry, resources ...io.Closer) *BuildError {
+	partial := partialProcessors{}
+	for _, entry := range entries {
+		if entry.Processor != nil {
+			partial.processors = append(partial.processors, entry.Processor)
+		}
+	}
+	owned := append(append([]io.Closer(nil), resources...), partial)
+	return &BuildError{Cause: cause, Pending: New(owned...)}
+}
+
 func NewPlan(entries []pipeline.Entry, resources ...io.Closer) (*Plan, error) {
 	copied := append([]pipeline.Entry(nil), entries...)
 	runner, err := pipeline.NewRunner(copied, pipeline.Options{})
 	if err != nil {
-		for _, e := range copied {
-			if e.Processor != nil {
-				err = errors.Join(err, e.Processor.Close())
-				err = errors.Join(err, e.Processor.WaitClosed(context.Background()))
-			}
-		}
-		g := New(resources...)
-		err = errors.Join(err, g.Close())
-		return nil, err
+		return nil, FailedBuild(err, copied, resources...)
 	}
 	resources = append(append([]io.Closer(nil), resources...), planResources{runner})
 	g := New(resources...)
 	for _, entry := range copied {
 		if err = entry.Processor.Describe().Validate(); err != nil {
-			return nil, errors.Join(err, g.Close())
+			return nil, &BuildError{Cause: err, Pending: g}
 		}
 	}
 	return &Plan{Generation: g, entries: copied}, nil

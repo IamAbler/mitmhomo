@@ -46,6 +46,10 @@ func TestM48RealConfigPublication(t *testing.T) {
 	roots := m35ExecutorCA(t, home)
 	lifecycle, _ := processor.NewLifecycle(1)
 	async := &m48AsyncProcessor{l: lifecycle, started: make(chan *processor.Invocation, 1), finish: make(chan *processor.Completion, 1)}
+	async.closeEntered = make(chan struct{})
+	async.closeRelease = make(chan struct{})
+	var releaseOld sync.Once
+	defer releaseOld.Do(func() { close(async.closeRelease) })
 	yaml := func(version string, enabled bool) []byte {
 		return []byte(fmt.Sprintf(`mode: direct
 log-level: silent
@@ -204,12 +208,44 @@ mitm:
 	require.Error(t, hub.ApplyConfig(invalid))
 	require.EqualValues(t, 1, partial.closed.Load())
 	require.Same(t, third, tunnel.MITMGeneration())
+	// A partial backend can violate bounded Close without owning the Apply
+	// thread. The failed Generation and its reservation remain explicit owners.
+	invalid, e = config.Parse(yaml("blocked-factory", true))
+	require.NoError(t, e)
+	blockedLife, _ := processor.NewLifecycle(1)
+	blocked := &m48AsyncProcessor{l: blockedLife, closeEntered: make(chan struct{}), closeRelease: make(chan struct{})}
+	var unblock sync.Once
+	defer unblock.Do(func() { close(blocked.closeRelease) })
+	invalid.MITM.ProcessorFactory = func() ([]pipeline.Entry, error) {
+		return []pipeline.Entry{{Class: pipeline.Script, Processor: blocked}}, fmt.Errorf("partial initialization failed")
+	}
+	failedApply := make(chan error, 1)
+	go func() { failedApply <- hub.ApplyConfig(invalid) }()
+	select {
+	case <-blocked.closeEntered:
+	case <-ctx.Done():
+		t.Fatal("partial Close not entered")
+	}
+	var failedErr error
+	select {
+	case failedErr = <-failedApply:
+	case <-ctx.Done():
+		t.Fatal("Apply held by partial Close")
+	}
+	require.ErrorIs(t, failedErr, context.DeadlineExceeded)
+	var pending *generation.BuildError
+	require.ErrorAs(t, failedErr, &pending)
+	require.Same(t, third, tunnel.MITMGeneration())
+	send(newest, "third")
 	require.Nil(t, apply("off", false))
 	send(h2, "old")
 	send(newest, "third")
 	fourth := apply("fourth", true)
 	send(start(true), "fourth")
 	require.NotEqual(t, third.ID(), fourth.ID())
+	unblock.Do(func() { close(blocked.closeRelease) })
+	require.NoError(t, pending.Pending.WaitClosed(ctx))
+	require.EqualValues(t, 1, blocked.closed.Load())
 	// Two real ApplyConfig calls serialize the entire Executor mutation path.
 	configs := make([]*config.Config, 2)
 	for i := range configs {
@@ -243,19 +279,42 @@ mitm:
 			require.Zero(t, async.closed.Load())
 			require.True(t, completion.Finish(model.Continue(), nil))
 			require.Zero(t, lifecycle.Active())
-			require.EqualValues(t, 1, async.closed.Load())
+			select {
+			case <-async.closeEntered:
+			case <-ctx.Done():
+				t.Fatal("retired cleanup not entered")
+			}
+			require.Equal(t, generation.Retiring, old.State())
+			// This full Hub/Executor publication and a new TLS/H2 connection
+			// must finish before the retired processor is allowed to close.
+			reloaded := apply("while-old-close-blocked", true)
+			bound := start(true)
+			send(bound, "while-old-close-blocked")
+			bound.raw.Close()
+			select {
+			case <-bound.done:
+			case <-ctx.Done():
+				t.Fatal("new connection stuck")
+			}
+			apply("off", false)
+			require.NoError(t, reloaded.WaitClosed(ctx))
+			releaseOld.Do(func() { close(async.closeRelease) })
 		}
 		require.NoError(t, g.WaitClosed(ctx))
+		if g == old {
+			require.EqualValues(t, 1, async.closed.Load())
+		}
 		require.Equal(t, generation.Closed, g.State())
 	}
 	t.Log("Parse -> hub.ApplyConfig -> executor.ApplyConfig -> Tunnel; H1/H2 pinned; rollback, disable/re-enable, concurrent ApplyConfig, explicit drain PASS")
 }
 
 type m48AsyncProcessor struct {
-	closed  atomic.Int32
-	l       *processor.Lifecycle
-	started chan *processor.Invocation
-	finish  chan *processor.Completion
+	closeEntered, closeRelease chan struct{}
+	closed                     atomic.Int32
+	l                          *processor.Lifecycle
+	started                    chan *processor.Invocation
+	finish                     chan *processor.Completion
 }
 
 func (p *m48AsyncProcessor) Describe() processor.Descriptor {
@@ -269,7 +328,14 @@ func (p *m48AsyncProcessor) Start(ctx context.Context, in model.Input, resources
 	}
 	return i, e
 }
-func (p *m48AsyncProcessor) Close() error                         { p.closed.Add(1); return p.l.Close() }
+func (p *m48AsyncProcessor) Close() error {
+	p.closed.Add(1)
+	if p.closeEntered != nil {
+		close(p.closeEntered)
+		<-p.closeRelease
+	}
+	return p.l.Close()
+}
 func (p *m48AsyncProcessor) WaitClosed(ctx context.Context) error { return p.l.WaitClosed(ctx) }
 func m48Transaction(id model.GenerationID) (*model.Transaction, error) {
 	ledger, e := model.NewLedger(-1, nil)

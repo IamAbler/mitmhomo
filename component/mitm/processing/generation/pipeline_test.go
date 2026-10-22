@@ -2,6 +2,7 @@ package generation
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -115,7 +116,14 @@ func TestPipelineCancelRetainsGenerationUntilExecutionDone(t *testing.T) {
 func TestPlanBuildFailureCleansOwnedResources(t *testing.T) {
 	c := &closer{}
 	plan, e := NewPlan([]pipeline.Entry{{Class: pipeline.Script}}, c)
-	if e == nil || plan != nil || c.n.Load() != 1 {
+	var failure *BuildError
+	if !errors.As(e, &failure) || plan != nil {
+		t.Fatal("missing cleanup owner")
+	}
+	if err := failure.Pending.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if c.n.Load() != 1 {
 		t.Fatal("candidate cleanup")
 	}
 }

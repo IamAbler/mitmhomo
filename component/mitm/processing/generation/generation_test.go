@@ -169,6 +169,11 @@ func TestCleanupDoesNotHoldAdmissionLock(t *testing.T) {
 	finished := make(chan struct{})
 	go func() { p.Publish(New()); close(finished) }()
 	<-c.entered
+	// A third publication must complete while the first generation's
+	// destructor remains blocked in a different publishing caller.
+	if err := p.Publish(New()); err != nil {
+		t.Fatal(err)
+	}
 	l, e := p.Bind()
 	if e != nil {
 		t.Fatal(e)
