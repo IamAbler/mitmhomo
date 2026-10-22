@@ -129,7 +129,7 @@ func (t *Transaction) TakeSynthetic() (SyntheticResponse, bool) {
 }
 
 // DecisionCopy returns budgeted copies of the policy code or abort reason for
-// the terminal exchange outcome. The caller owns and must close to; reads
+// the terminal exchange outcome. The caller owns and must close it; reads
 // remain available after Terminate and stop after Transaction.Close.
 func (t *Transaction) DecisionCopy(to *CopyLease) (ExchangeOutcome, string, string, error) {
 	if t == nil || to == nil {
