@@ -16,7 +16,7 @@ type RawRewrite rewrite.Config
 func (raw *RawRewrite) UnmarshalYAML(node *yaml.Node) error {
 	// Check the original node graph instead of re-serializing a subtree: aliases
 	// may point to anchors elsewhere in the parent Mihomo configuration.
-	if err := checkRewriteFields(node, reflect.TypeOf(rewrite.Config{}), make(map[rewriteFieldVisit]uint8)); err != nil {
+	if err := checkStrictFields(node, reflect.TypeOf(rewrite.Config{}), make(map[rewriteFieldVisit]uint8), "mitm.rewrite"); err != nil {
 		return err
 	}
 	var config rewrite.Config
@@ -32,20 +32,20 @@ type rewriteFieldVisit struct {
 	typ  reflect.Type
 }
 
-func checkRewriteFields(node *yaml.Node, typ reflect.Type, visiting map[rewriteFieldVisit]uint8) error {
+func checkStrictFields(node *yaml.Node, typ reflect.Type, visiting map[rewriteFieldVisit]uint8, prefix string) error {
 	visit := rewriteFieldVisit{node, typ}
 	if visiting[visit] == 2 {
 		return nil
 	}
 	if visiting[visit] == 1 {
-		return fmt.Errorf("mitm.rewrite: recursive YAML alias")
+		return fmt.Errorf("%s: recursive YAML alias", prefix)
 	}
 	// Memoize node/type pairs so shared merge aliases cannot make validation
 	// expand exponentially before the YAML decoder's alias checks run.
 	visiting[visit] = 1
 	defer func() { visiting[visit] = 2 }()
 	if node.Kind == yaml.AliasNode {
-		return checkRewriteFields(node.Alias, typ, visiting)
+		return checkStrictFields(node.Alias, typ, visiting, prefix)
 	}
 	for typ.Kind() == reflect.Ptr {
 		typ = typ.Elem()
@@ -65,27 +65,27 @@ func checkRewriteFields(node *yaml.Node, typ reflect.Type, visiting map[rewriteF
 			if key.Tag == "!!merge" {
 				if value.Kind == yaml.SequenceNode {
 					for _, child := range value.Content {
-						if err := checkRewriteFields(child, typ, visiting); err != nil {
+						if err := checkStrictFields(child, typ, visiting, prefix); err != nil {
 							return err
 						}
 					}
-				} else if err := checkRewriteFields(value, typ, visiting); err != nil {
+				} else if err := checkStrictFields(value, typ, visiting, prefix); err != nil {
 					return err
 				}
 				continue
 			}
 			fieldType, ok := fields[key.Value]
 			if !ok {
-				return fmt.Errorf("mitm.rewrite: line %d: unknown field %q", key.Line, key.Value)
+				return fmt.Errorf("%s: line %d: unknown field %q", prefix, key.Line, key.Value)
 			}
-			if err := checkRewriteFields(value, fieldType, visiting); err != nil {
+			if err := checkStrictFields(value, fieldType, visiting, prefix); err != nil {
 				return err
 			}
 		}
 	case reflect.Slice:
 		if node.Kind == yaml.SequenceNode {
 			for _, child := range node.Content {
-				if err := checkRewriteFields(child, typ.Elem(), visiting); err != nil {
+				if err := checkStrictFields(child, typ.Elem(), visiting, prefix); err != nil {
 					return err
 				}
 			}
@@ -93,7 +93,7 @@ func checkRewriteFields(node *yaml.Node, typ reflect.Type, visiting map[rewriteF
 	case reflect.Map:
 		if node.Kind == yaml.MappingNode {
 			for i := 1; i < len(node.Content); i += 2 {
-				if err := checkRewriteFields(node.Content[i], typ.Elem(), visiting); err != nil {
+				if err := checkStrictFields(node.Content[i], typ.Elem(), visiting, prefix); err != nil {
 					return err
 				}
 			}

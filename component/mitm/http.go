@@ -1,6 +1,7 @@
 package mitm
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,9 +20,11 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/mitm/httphook"
 	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	domainname "github.com/metacubex/sing/common/metadata"
 )
 
@@ -60,7 +64,8 @@ type ResponseHook func(*http.Response) error
 // can continue. DispatchFailed means the SNI matched but the connection could
 // not be prepared or served; callers must not resume native ciphertext relay.
 func (m *Manager) Dispatch(ctx context.Context, conn *N.BufferedConn, metadata *C.Metadata, prepare MetadataPreparer, dial NativeDialContext) (outcome DispatchOutcome, err error) {
-	snapshot := m.loadSnapshot()
+	snapshot, releaseSnapshot := m.acquireSnapshot()
+	defer releaseSnapshot()
 	if snapshot == nil || !snapshot.config.Enabled || metadata == nil || !portAllowed(snapshot, metadata.DstPort) {
 		return DispatchUnmatched, nil
 	}
@@ -93,6 +98,18 @@ func failedDispatch(conn net.Conn, err error) (DispatchOutcome, error) {
 		_ = conn.Close()
 	}
 	return DispatchFailed, err
+}
+
+func sameRequestBody(a, b io.ReadCloser) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	valueA := reflect.ValueOf(a)
+	valueB := reflect.ValueOf(b)
+	if valueA.Type() != valueB.Type() || !valueA.Comparable() || !valueB.Comparable() {
+		return false
+	}
+	return valueA.Interface() == valueB.Interface()
 }
 
 func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadata *C.Metadata, hello *sniffer.TLSClientHelloInfo, dial NativeDialContext, snapshot *configSnapshot) error {
@@ -191,10 +208,37 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		request.URL = urlTarget
 		request.RequestURI = ""
 		var discardedBody *requestBodyDiscard
+		requestBodyStillServerOwned := true
 		if snapshot.config.RequestHook != nil {
+			bodyBeforeInternalHook := request.Body
 			if err := snapshot.config.RequestHook(request); err != nil {
 				rejectRequest(w, r, http.StatusBadRequest, "request rejected")
 				return
+			}
+			requestBodyStillServerOwned = sameRequestBody(request.Body, bodyBeforeInternalHook)
+		}
+		if hooks := snapshot.config.ScriptHooks; hooks != nil {
+			applyRequestHook := hooks.ApplyRequest
+			if requestBodyStillServerOwned {
+				// net/http.Server closes the original request body after this
+				// handler returns, so the script stage must leave it open.
+				applyRequestHook = hooks.ApplyRequestWithExternalBodyOwner
+			}
+			hookResult, err := applyRequestHook(request.Context(), request)
+			if err != nil {
+				if request.Context().Err() != nil {
+					return
+				}
+				rejectRequest(w, r, http.StatusBadRequest, "request body could not be buffered for HTTP script hook")
+				return
+			}
+			if hookResult.Fallback != nil {
+				log.Warnln("MITM HTTP request script hook fallback: %s", hookResult.Fallback)
+			}
+			if hookResult.Applied {
+				if err := applyRequestScriptResult(request, hookResult); err != nil {
+					log.Warnln("MITM HTTP request script hook returned invalid output; forwarding original request: %s", err)
+				}
 			}
 		}
 		if request.URL == nil {
@@ -264,16 +308,33 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 			},
 			Rewrite: func(*httputil.ProxyRequest) {},
 			ModifyResponse: func(response *http.Response) error {
+				forceResponseAdapter := snapshot.config.ResponseHook != nil
 				if snapshot.config.ResponseHook != nil {
 					if err := snapshot.config.ResponseHook(response); err != nil {
 						return err
+					}
+				}
+				if hooks := snapshot.config.ScriptHooks; hooks != nil {
+					hookResult, err := hooks.ApplyResponse(request.Context(), request, response)
+					if err != nil {
+						return fmt.Errorf("buffer response for HTTP script hook: %w", err)
+					}
+					if hookResult.Fallback != nil {
+						log.Warnln("MITM HTTP response script hook fallback: %s", hookResult.Fallback)
+					}
+					if hookResult.Applied {
+						if err := applyResponseScriptResult(response, hookResult, r.Method); err != nil {
+							log.Warnln("MITM HTTP response script hook returned invalid output; forwarding original response: %s", err)
+						} else {
+							forceResponseAdapter = true
+						}
 					}
 				}
 				err := applyResponseRewrite(request.Context(), rewrite.RequestView{
 					Method:  request.Method,
 					URL:     *request.URL,
 					Headers: requestHeaders(request.Header, request.Host),
-				}, response, snapshot.config.Rewrite, snapshot.config.ResponseHook != nil, r.Method)
+				}, response, snapshot.config.Rewrite, forceResponseAdapter, r.Method)
 				if err == nil && r.ProtoMajor == 2 && response.StatusCode == http.StatusNotModified {
 					// A 304 has no DATA. Omit optional representation length for
 					// clients that interpret it as a promised stream length.
@@ -396,6 +457,101 @@ func applyRequestResult(request *http.Request, result rewrite.RequestResult) err
 		// discard the incoming type when it would describe the replaced body.
 		request.Header.Del("Content-Type")
 	}
+	return nil
+}
+
+func applyRequestScriptResult(request *http.Request, result httphook.RequestResult) error {
+	if request == nil {
+		return errors.New("cannot apply an HTTP script result to a nil request")
+	}
+	candidate := request.Clone(request.Context())
+	if result.Method != nil {
+		candidate.Method = *result.Method
+	}
+	if result.URL != nil {
+		target := *result.URL
+		candidate.URL = &target
+	}
+	if result.Host != nil {
+		candidate.Host = *result.Host
+	}
+	oldContentType := append([]string(nil), request.Header.Values("Content-Type")...)
+	if result.Headers != nil {
+		candidate.Header = result.Headers.Clone()
+		candidate.Header.Del("Host")
+	}
+	candidate.RequestURI = ""
+	if result.BodyChanged {
+		body := append([]byte(nil), result.Body...)
+		candidate.Body = io.NopCloser(bytes.NewReader(body))
+		candidate.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		candidate.ContentLength = int64(len(body))
+		candidate.TransferEncoding = nil
+		candidate.Trailer = nil
+		for _, name := range []string{
+			"Content-Length", "Transfer-Encoding", "Trailer", "Expect", "Content-Encoding",
+			"Content-MD5", "Digest", "Content-Range",
+		} {
+			candidate.Header.Del(name)
+		}
+		if equalHeaderValues(oldContentType, candidate.Header.Values("Content-Type")) {
+			candidate.Header.Del("Content-Type")
+		}
+	}
+	if err := normalizeRequestURL(candidate); err != nil {
+		return err
+	}
+	request.Method = candidate.Method
+	request.URL = candidate.URL
+	request.Host = candidate.Host
+	request.Header = candidate.Header
+	request.Body = candidate.Body
+	request.GetBody = candidate.GetBody
+	request.ContentLength = candidate.ContentLength
+	request.TransferEncoding = candidate.TransferEncoding
+	request.Trailer = candidate.Trailer
+	request.RequestURI = ""
+	return nil
+}
+
+func applyResponseScriptResult(response *http.Response, result httphook.ResponseResult, downstreamMethod string) error {
+	if response == nil {
+		return errors.New("cannot apply an HTTP script result to a nil response")
+	}
+	candidate := *response
+	candidate.Header = response.Header.Clone()
+	if result.Headers != nil {
+		candidate.Header = result.Headers.Clone()
+	}
+	if result.Status != nil {
+		candidate.StatusCode = *result.Status
+		candidate.Status = responseStatus(*result.Status)
+	}
+	var bodyReplacement *rewrite.BodyReplacement
+	contentTypeModified := false
+	if result.BodyChanged {
+		bodyReplacement = &rewrite.BodyReplacement{Replace: string(result.Body)}
+		contentTypeModified = !equalHeaderValues(response.Header.Values("Content-Type"), candidate.Header.Values("Content-Type"))
+	}
+	rewriteResult := rewrite.ResponseResult{
+		Response: rewrite.ResponseView{
+			StatusCode: candidate.StatusCode,
+			Headers:    rewrite.HeaderMap(candidate.Header),
+		},
+		Changed:             true,
+		Body:                bodyReplacement,
+		ContentTypeModified: contentTypeModified,
+	}
+	if err := applyResponseResult(&candidate, rewriteResult, downstreamMethod); err != nil {
+		return err
+	}
+	response.Status = candidate.Status
+	response.StatusCode = candidate.StatusCode
+	response.Header = candidate.Header
+	response.Body = candidate.Body
+	response.ContentLength = candidate.ContentLength
+	response.Trailer = candidate.Trailer
+	response.TransferEncoding = candidate.TransferEncoding
 	return nil
 }
 

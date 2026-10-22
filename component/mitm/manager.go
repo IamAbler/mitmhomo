@@ -7,10 +7,12 @@ import (
 	"errors"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/mitm/httphook"
 	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
@@ -43,6 +45,7 @@ type Config struct {
 	IdleTimeout        time.Duration
 	RequestHook        RequestHook
 	ResponseHook       ResponseHook
+	ScriptHooks        *httphook.Snapshot
 	// Rewrite is immutable after publication and fixed for each intercepted TLS
 	// connection. The HTTP adapter applies its request and response stages.
 	Rewrite *rewrite.Snapshot
@@ -57,6 +60,9 @@ type configSnapshot struct {
 	portRanges   []PortRange
 	domains      map[string]struct{}
 	wildcardHost []string
+	refs         atomic.Int64
+	retired      atomic.Bool
+	closeOnce    sync.Once
 }
 
 // Manager publishes immutable configuration snapshots. A nil or disabled
@@ -89,6 +95,7 @@ func (m *Manager) Update(config Config) {
 			IdleTimeout:        config.IdleTimeout,
 			RequestHook:        config.RequestHook,
 			ResponseHook:       config.ResponseHook,
+			ScriptHooks:        cloneScriptHooks(config.Enabled, config.ScriptHooks),
 			Rewrite:            config.Rewrite,
 			upstreamRootCAs:    config.upstreamRootCAs,
 		},
@@ -114,9 +121,66 @@ func (m *Manager) Update(config Config) {
 			snapshot.domains[domain] = struct{}{}
 		}
 	}
-	m.snapshot.Store(snapshot)
+	snapshot.refs.Store(1) // Manager ownership, released on the next Update.
+	previous := m.snapshot.Swap(snapshot)
+	if previous != nil {
+		previous.retire()
+	}
 }
 
+func cloneScriptHooks(enabled bool, hooks *httphook.Snapshot) *httphook.Snapshot {
+	if !enabled || hooks == nil {
+		return nil
+	}
+	return hooks.Clone()
+}
+
+func (s *configSnapshot) tryAcquire() bool {
+	if s == nil {
+		return false
+	}
+	for {
+		if s.retired.Load() {
+			return false
+		}
+		refs := s.refs.Load()
+		if refs <= 0 {
+			return false
+		}
+		if !s.refs.CompareAndSwap(refs, refs+1) {
+			continue
+		}
+		if !s.retired.Load() {
+			return true
+		}
+		s.release()
+		return false
+	}
+}
+
+func (s *configSnapshot) release() {
+	if s == nil {
+		return
+	}
+	if s.refs.Add(-1) == 0 {
+		s.closeOnce.Do(func() {
+			if s.config.ScriptHooks != nil {
+				_ = s.config.ScriptHooks.Close()
+			}
+		})
+	}
+}
+
+func (s *configSnapshot) retire() {
+	if s != nil && s.retired.CompareAndSwap(false, true) {
+		s.release() // Manager ownership.
+	}
+}
+
+// ConfigSnapshot returns a detached configuration copy. If ScriptHooks is
+// non-nil, the returned value owns a cloned Snapshot; callers that retain or
+// execute it must close that Snapshot when it is no longer needed. Update
+// clones the supplied hooks, so the caller retains ownership of its input.
 func (m *Manager) ConfigSnapshot() Config {
 	if m == nil {
 		return Config{}
@@ -138,6 +202,7 @@ func (m *Manager) ConfigSnapshot() Config {
 		IdleTimeout:        snapshot.config.IdleTimeout,
 		RequestHook:        snapshot.config.RequestHook,
 		ResponseHook:       snapshot.config.ResponseHook,
+		ScriptHooks:        snapshot.config.ScriptHooks.Clone(),
 		Rewrite:            snapshot.config.Rewrite,
 		upstreamRootCAs:    snapshot.config.upstreamRootCAs,
 	}
@@ -164,6 +229,21 @@ func (m *Manager) loadSnapshot() *configSnapshot {
 		return nil
 	}
 	return m.snapshot.Load()
+}
+
+func (m *Manager) acquireSnapshot() (*configSnapshot, func()) {
+	if m == nil {
+		return nil, func() {}
+	}
+	for {
+		snapshot := m.snapshot.Load()
+		if snapshot == nil {
+			return nil, func() {}
+		}
+		if snapshot.tryAcquire() {
+			return snapshot, snapshot.release
+		}
+	}
 }
 
 // InspectClientHello only reads when the manager is enabled for this port.
