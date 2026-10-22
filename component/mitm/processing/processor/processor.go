@@ -93,3 +93,13 @@ type Processor interface {
 	Close() error
 	WaitClosed(context.Context) error
 }
+
+// ExecutionFinalizer is an optional generation ownership barrier. Close is
+// used by the caller on Start failure; after successful transfer Finish calls
+// FinalizeExecution only after ExecutionDone and admission bookkeeping. It
+// must be idempotent. Input and ordinary execution resources retain their
+// existing pre-ExecutionDone cleanup contract.
+type ExecutionFinalizer interface {
+	io.Closer
+	FinalizeExecution()
+}

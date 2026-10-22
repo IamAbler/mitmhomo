@@ -279,7 +279,16 @@ func (c *Completion) Finish(result model.DoneResult, err error) bool {
 		candidate = result
 	}
 
-	resourceErr := i.releaseResources(resources)
+	var finalizers []ExecutionFinalizer
+	ordinary := resources[:0]
+	for _, resource := range resources {
+		if finalizer, ok := resource.(ExecutionFinalizer); ok {
+			finalizers = append(finalizers, finalizer)
+		} else {
+			ordinary = append(ordinary, resource)
+		}
+	}
+	resourceErr := i.releaseResources(ordinary)
 	if resourceErr != nil {
 		if candidate.Kind() != model.ResultInvalid {
 			_ = candidate.Release()
@@ -333,6 +342,9 @@ func (c *Completion) Finish(result model.DoneResult, err error) bool {
 	}
 	if onExecutionDone != nil {
 		onExecutionDone()
+	}
+	for _, finalizer := range finalizers {
+		finalizer.FinalizeExecution()
 	}
 	return true
 }

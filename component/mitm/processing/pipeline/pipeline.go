@@ -319,6 +319,10 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	resources := []io.Closer{&onceCloser{inner: inputLease}}
 	prepareResource := func(resource io.Closer) {
 		if resource != nil {
+			if _, ok := resource.(processor.ExecutionFinalizer); ok {
+				resources = append(resources, resource)
+				return
+			}
 			resources = append(resources, &onceCloser{inner: resource})
 		}
 	}
