@@ -164,10 +164,14 @@ type Transaction struct {
 	closeErr                                  error
 	outcome                                   ExchangeOutcome
 	mainUpstreamIssued                        bool
+	currentInvocation                         InvocationID
 	synthetic                                 SyntheticResponse
 	hasSynthetic                              bool
 	decisionLease                             *CopyLease
 	decisionCode, decisionReason              string
+	pipelineGate                              chan struct{}
+	pipelineRunning                           Phase
+	pipelineDone                              [3]bool
 }
 
 func NewTransaction(parent context.Context, options TransactionOptions) (*Transaction, error) {
@@ -181,7 +185,9 @@ func NewTransaction(parent context.Context, options TransactionOptions) (*Transa
 		return nil, context.Cause(parent)
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	t := &Transaction{ctx: ctx, cancel: cancel, ledger: options.Ledger, generation: options.Generation, phase: RequestPhase, revision: 1, requestBody: options.RequestBody}
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	t := &Transaction{ctx: ctx, cancel: cancel, ledger: options.Ledger, generation: options.Generation, phase: RequestPhase, revision: 1, requestBody: options.RequestBody, pipelineGate: gate}
 	t.ingressLease = NewCopyLease(t.ledger)
 	t.entryLease = NewCopyLease(t.ledger)
 	t.requestLease = NewCopyLease(t.ledger)
@@ -329,6 +335,7 @@ func (t *Transaction) EnterResponse(expected Revision, original, entry ResponseH
 	t.origin = origin
 	t.phase = ResponsePhase
 	t.revision++
+	t.currentInvocation = ""
 	if t.outcome == ExchangePending {
 		// Preserve the M4.5 owner API for callers that enter a response directly;
 		// the independent Pipeline uses ClaimMainUpstream before the adapter I/O.
@@ -488,7 +495,7 @@ func (t *Transaction) Snapshot(invocation InvocationID) (Input, *CopyLease, erro
 	if err := t.check(t.revision); err != nil {
 		return Input{}, nil, err
 	}
-	if t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted || t.phase == RequestPhase && t.outcome == ExchangeUpstreamIssued {
+	if t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted {
 		return Input{}, nil, ErrClosed
 	}
 	if invocation == "" {
@@ -547,5 +554,6 @@ func (t *Transaction) Snapshot(invocation InvocationID) (Input, *CopyLease, erro
 		}
 	}
 	failed = false
+	t.currentInvocation = invocation
 	return out, lease, nil
 }

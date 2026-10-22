@@ -1,9 +1,82 @@
 package model
 
 import (
+	"context"
 	"math"
 	"strings"
+	"sync"
 )
+
+// PipelinePhasePermit serializes a Transaction's Processor stages across
+// independent Runner instances. Releasing the permit marks the phase consumed,
+// including when execution failed, so a caller cannot accidentally replay
+// entries against an exchange whose outcome is already uncertain.
+type PipelinePhasePermit struct {
+	tx    *Transaction
+	phase Phase
+	once  sync.Once
+}
+
+// AcquirePipelinePhase reserves the requested phase for one Runner. The bool
+// result is true when a Response phase is intentionally skipped because the
+// Request phase already committed a SyntheticResponse.
+func (t *Transaction) AcquirePipelinePhase(ctx context.Context, phase Phase) (*PipelinePhasePermit, bool, error) {
+	if t == nil || phase != RequestPhase && phase != ResponsePhase {
+		return nil, false, ErrInvalid
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false, context.Cause(ctx)
+	case <-t.ctx.Done():
+		return nil, false, context.Cause(t.ctx)
+	case <-t.pipelineGate:
+	}
+	t.mu.Lock()
+	if err := context.Cause(ctx); ctx.Err() != nil {
+		t.mu.Unlock()
+		t.pipelineGate <- struct{}{}
+		return nil, false, err
+	}
+	if err := t.check(t.revision); err != nil {
+		t.mu.Unlock()
+		t.pipelineGate <- struct{}{}
+		return nil, false, err
+	}
+	if phase == ResponsePhase && t.outcome == ExchangeSynthetic {
+		t.mu.Unlock()
+		t.pipelineGate <- struct{}{}
+		return nil, true, nil
+	}
+	validOutcome := phase == RequestPhase && t.phase == RequestPhase && t.outcome == ExchangePending ||
+		phase == ResponsePhase && t.phase == ResponsePhase && t.outcome == ExchangeUpstreamIssued
+	if !validOutcome || t.pipelineDone[phase] || t.pipelineRunning != PhaseInvalid {
+		t.mu.Unlock()
+		t.pipelineGate <- struct{}{}
+		return nil, false, ErrInvalid
+	}
+	t.pipelineRunning = phase
+	t.mu.Unlock()
+	return &PipelinePhasePermit{tx: t, phase: phase}, false, nil
+}
+
+// Release ends one serialized phase exactly once.
+func (p *PipelinePhasePermit) Release() {
+	if p == nil || p.tx == nil {
+		return
+	}
+	p.once.Do(func() {
+		p.tx.mu.Lock()
+		if p.tx.pipelineRunning == p.phase {
+			p.tx.pipelineRunning = PhaseInvalid
+			p.tx.pipelineDone[p.phase] = true
+		}
+		p.tx.mu.Unlock()
+		p.tx.pipelineGate <- struct{}{}
+	})
+}
 
 // ClaimMainUpstream atomically reserves the Transaction's single main upstream
 // request after its Request phase has completed. It records the transition in
@@ -15,7 +88,7 @@ func (t *Transaction) ClaimMainUpstream(input Input) (Revision, error) {
 	if err := t.check(key.Revision); err != nil {
 		return t.revision, err
 	}
-	if key.TransactionID != t.id || key.Generation != t.generation || key.Phase != RequestPhase || t.phase != RequestPhase || key.Invocation == "" || t.outcome != ExchangePending || t.mainUpstreamIssued {
+	if key.TransactionID != t.id || key.Generation != t.generation || input.connection.ID != t.connection.ID || key.Phase != RequestPhase || t.phase != RequestPhase || key.Invocation == "" || key.Invocation != t.currentInvocation || t.outcome != ExchangePending || t.mainUpstreamIssued {
 		return t.revision, ErrInvalid
 	}
 	if t.revision == Revision(math.MaxUint64) {
@@ -24,6 +97,7 @@ func (t *Transaction) ClaimMainUpstream(input Input) (Revision, error) {
 	t.mainUpstreamIssued = true
 	t.outcome = ExchangeUpstreamIssued
 	t.revision++
+	t.currentInvocation = ""
 	return t.revision, nil
 }
 
@@ -54,7 +128,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 	if err := t.check(key.Revision); err != nil {
 		return ResultInvalid, err
 	}
-	if key.TransactionID != t.id || key.Generation != t.generation || key.Phase != t.phase || key.Invocation == "" {
+	if key.TransactionID != t.id || key.Generation != t.generation || input.connection.ID != t.connection.ID || key.Phase != t.phase || key.Invocation == "" || key.Invocation != t.currentInvocation {
 		return ResultInvalid, ErrInvalid
 	}
 	if key.Phase == RequestPhase && t.outcome != ExchangePending || key.Phase == ResponsePhase && t.outcome != ExchangeUpstreamIssued {
@@ -66,6 +140,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 
 	switch result.Kind() {
 	case ResultContinue, ResultStopPhase:
+		t.currentInvocation = ""
 		return result.Kind(), nil
 	case ResultRequestChange:
 		patch := *result.payload.request
@@ -89,6 +164,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 		old := t.requestLease
 		t.request, t.requestLease = head, lease
 		t.revision++
+		t.currentInvocation = ""
 		old.Close()
 		return ResultRequestChange, nil
 	case ResultResponseChange:
@@ -113,6 +189,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 		old := t.responseLease
 		t.response, t.responseLease = head, lease
 		t.revision++
+		t.currentInvocation = ""
 		old.Close()
 		return ResultResponseChange, nil
 	case ResultRespond:
@@ -124,6 +201,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 		t.synthetic, t.hasSynthetic = copy, true
 		t.outcome = ExchangeSynthetic
 		t.revision++
+		t.currentInvocation = ""
 		return ResultRespond, nil
 	case ResultReject:
 		code := result.payload.code
@@ -137,6 +215,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 		t.decisionCode = copy
 		t.outcome = ExchangeRejected
 		t.revision++
+		t.currentInvocation = ""
 		return ResultReject, nil
 	case ResultAbort:
 		reason := result.payload.reason
@@ -150,6 +229,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 		t.decisionReason = copy
 		t.outcome = ExchangeAborted
 		t.revision++
+		t.currentInvocation = ""
 		return ResultAbort, nil
 	default:
 		return ResultInvalid, ErrInvalid

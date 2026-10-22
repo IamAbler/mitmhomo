@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -154,7 +155,95 @@ func TestClaimMainUpstreamIsSingleAndGenerationBound(t *testing.T) {
 	if _, err := tx.ClaimMainUpstream(input); !errors.Is(err, ErrStaleRevision) {
 		t.Fatalf("duplicate/stale upstream claim accepted: %v", err)
 	}
-	if _, _, err := tx.Snapshot("after-upstream"); !errors.Is(err, ErrClosed) {
-		t.Fatalf("request input remained open after upstream claim: %v", err)
+	egress, egressLease, err := tx.Snapshot("after-upstream")
+	if err != nil {
+		t.Fatalf("read-only request egress snapshot failed: %v", err)
+	}
+	defer egressLease.Close()
+	if _, err := tx.Commit(egress, Continue()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("request result committed after upstream claim: %v", err)
+	}
+}
+
+func TestCommitBindsConnectionAndSingleInvocation(t *testing.T) {
+	ledger := testLedger(t, -1)
+	firstTx, firstLease := testTransaction(t, context.Background(), ledger, BodySlot{})
+	firstLease.Close()
+	input, inputLease, err := firstTx.Snapshot("first-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inputLease.Close()
+
+	otherConnectionHeadLease := NewCopyLease(ledger)
+	otherHead := testHead(t, otherConnectionHeadLease, "POST", "https://example.test/a%2Fb?b=2&a=&b=1")
+	otherTx, err := NewTransaction(context.Background(), TransactionOptions{
+		ID: "tx-1", Generation: 7, Connection: ConnectionView{ID: "other-connection"},
+		OriginalIngress: otherHead, Request: otherHead, Ledger: ledger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherTx.Close()
+	otherConnectionHeadLease.Close()
+	result := Continue()
+	if _, err := otherTx.Commit(input, result); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("different connection accepted an input key: %v", err)
+	}
+
+	first, firstInputLease, err := firstTx.Snapshot("first-invocation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstInputLease.Close()
+	_, supersedingLease, err := firstTx.Snapshot("superseding-invocation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer supersedingLease.Close()
+	if _, err := firstTx.Commit(first, result); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("superseded invocation committed: %v", err)
+	}
+}
+
+func TestPipelinePhasePermitSerializesConcurrentRunners(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		ledger := testLedger(t, -1)
+		tx, sourceLease := testTransaction(t, context.Background(), ledger, BodySlot{})
+		sourceLease.Close()
+		start := make(chan struct{})
+		ready := make(chan struct{}, 2)
+		type acquired struct {
+			permit *PipelinePhasePermit
+			err    error
+		}
+		results := make(chan acquired, 2)
+		var wg sync.WaitGroup
+		for i := 0; i < 2; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ready <- struct{}{}
+				<-start
+				permit, skipped, err := tx.AcquirePipelinePhase(context.Background(), RequestPhase)
+				if skipped {
+					err = ErrInvalid
+				}
+				results <- acquired{permit: permit, err: err}
+			}()
+		}
+		<-ready
+		<-ready
+		close(start)
+		first := <-results
+		if first.err != nil || first.permit == nil {
+			t.Fatalf("round %d: first phase acquisition failed: %v", round, first.err)
+		}
+		first.permit.Release()
+		second := <-results
+		if second.permit != nil || !errors.Is(second.err, ErrInvalid) {
+			t.Fatalf("round %d: concurrent phase replay was allowed: %+v", round, second)
+		}
+		wg.Wait()
 	}
 }

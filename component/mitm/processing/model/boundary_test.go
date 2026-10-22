@@ -40,8 +40,9 @@ func TestModelDependencyBoundary(t *testing.T) {
 			return true
 		})
 	}
-	// The processor layer is the one intentional production dependency on the
-	// model. No protocol, engine, or existing production package may import it.
+	// The processor and pipeline layers are the only intentional production
+	// dependencies on the model. No protocol, engine, or existing production
+	// package may import it.
 	const target = "github.com/metacubex/mihomo/component/mitm/processing/model"
 	root := filepath.Clean("../../../..")
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
@@ -49,7 +50,7 @@ func TestModelDependencyBoundary(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" || path == filepath.Join(root, "component", "mitm", "processing", "model") || path == filepath.Join(root, "component", "mitm", "processing", "processor") || strings.HasPrefix(entry.Name(), ".") && path != root {
+			if entry.Name() == ".git" || path == filepath.Join(root, "component", "mitm", "processing", "model") || path == filepath.Join(root, "component", "mitm", "processing", "processor") || path == filepath.Join(root, "component", "mitm", "processing", "pipeline") || strings.HasPrefix(entry.Name(), ".") && path != root {
 				return filepath.SkipDir
 			}
 			return nil
