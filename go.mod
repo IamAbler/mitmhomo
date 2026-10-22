@@ -6,6 +6,7 @@ require (
 	github.com/bahlo/generic-list-go v0.2.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/dlclark/regexp2 v1.12.0
+	github.com/dop251/goja v0.0.0-20260603125802-cfe4039cb6d7
 	github.com/easytier/easytier/easytier-go v0.0.0-20260910071355-3d0c9c3ca5e2
 	github.com/enfein/mieru/v3 v3.38.1
 	github.com/gobwas/ws v1.4.0
@@ -97,6 +98,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
 	github.com/gaukas/godicttls v0.0.4 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
