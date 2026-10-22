@@ -29,6 +29,18 @@ const (
 	Closed
 )
 
+// ExchangeOutcome is the owner-controlled disposition of the main HTTP
+// exchange. Side requests made by a Processor are outside this state.
+type ExchangeOutcome uint8
+
+const (
+	ExchangePending ExchangeOutcome = iota
+	ExchangeUpstreamIssued
+	ExchangeSynthetic
+	ExchangeRejected
+	ExchangeAborted
+)
+
 type ResponseOrigin uint8
 
 const (
@@ -150,6 +162,12 @@ type Transaction struct {
 	responseLease                             *CopyLease
 	requestBody, responseBody                 BodySlot
 	closeErr                                  error
+	outcome                                   ExchangeOutcome
+	mainUpstreamIssued                        bool
+	synthetic                                 SyntheticResponse
+	hasSynthetic                              bool
+	decisionLease                             *CopyLease
+	decisionCode, decisionReason              string
 }
 
 func NewTransaction(parent context.Context, options TransactionOptions) (*Transaction, error) {
@@ -231,6 +249,7 @@ func (t *Transaction) CancellationCause() error    { return context.Cause(t.ctx)
 func (t *Transaction) Revision() Revision          { t.mu.Lock(); defer t.mu.Unlock(); return t.revision }
 func (t *Transaction) Phase() Phase                { t.mu.Lock(); defer t.mu.Unlock(); return t.phase }
 func (t *Transaction) State() TransactionState     { t.mu.Lock(); defer t.mu.Unlock(); return t.state }
+func (t *Transaction) Outcome() ExchangeOutcome    { t.mu.Lock(); defer t.mu.Unlock(); return t.outcome }
 func (t *Transaction) Ledger() *Ledger             { return t.ledger } // Owner-only accounting.
 
 func (t *Transaction) check(expected Revision) error {
@@ -252,7 +271,7 @@ func (t *Transaction) UpdateRequest(expected Revision, head RequestHead) error {
 	if err := t.check(expected); err != nil {
 		return err
 	}
-	if t.phase != RequestPhase {
+	if t.phase != RequestPhase || t.outcome != ExchangePending {
 		return ErrInvalid
 	}
 	lease := NewCopyLease(t.ledger)
@@ -274,7 +293,7 @@ func (t *Transaction) EnterResponse(expected Revision, original, entry ResponseH
 	if err := t.check(expected); err != nil {
 		return err
 	}
-	if t.phase != RequestPhase || origin < OriginUpstream || origin > OriginPolicy {
+	if t.phase != RequestPhase || origin < OriginUpstream || origin > OriginPolicy || t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted {
 		return ErrInvalid
 	}
 	originalLease, entryLease, workLease := NewCopyLease(t.ledger), NewCopyLease(t.ledger), NewCopyLease(t.ledger)
@@ -310,6 +329,12 @@ func (t *Transaction) EnterResponse(expected Revision, original, entry ResponseH
 	t.origin = origin
 	t.phase = ResponsePhase
 	t.revision++
+	if t.outcome == ExchangePending {
+		// Preserve the M4.5 owner API for callers that enter a response directly;
+		// the independent Pipeline uses ClaimMainUpstream before the adapter I/O.
+		t.mainUpstreamIssued = true
+		t.outcome = ExchangeUpstreamIssued
+	}
 	success = true
 	return nil
 }
@@ -319,7 +344,7 @@ func (t *Transaction) UpdateResponse(expected Revision, head ResponseHead) error
 	if err := t.check(expected); err != nil {
 		return err
 	}
-	if t.phase != ResponsePhase {
+	if t.phase != ResponsePhase || t.outcome != ExchangeUpstreamIssued {
 		return ErrInvalid
 	}
 	lease := NewCopyLease(t.ledger)
@@ -346,6 +371,9 @@ func (t *Transaction) PrepareBody(need BodyNeed, limit int64) error {
 	if err := t.check(t.revision); err != nil {
 		return err
 	}
+	if t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted || t.phase == RequestPhase && t.outcome == ExchangeUpstreamIssued {
+		return ErrClosed
+	}
 	b := t.bodyLocked()
 	if b == nil {
 		if need == None {
@@ -360,6 +388,9 @@ func (t *Transaction) ReplaceBody(expected Revision, data []byte) error {
 	defer t.mu.Unlock()
 	if err := t.check(expected); err != nil {
 		return err
+	}
+	if t.outcome != ExchangePending && !(t.phase == ResponsePhase && t.outcome == ExchangeUpstreamIssued) {
+		return ErrClosed
 	}
 	b := t.bodyLocked()
 	if b == nil {
@@ -377,6 +408,9 @@ func (t *Transaction) TakeBody() (io.ReadCloser, error) {
 	if err := t.check(t.revision); err != nil {
 		return nil, err
 	}
+	if t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted {
+		return nil, ErrClosed
+	}
 	b := t.bodyLocked()
 	if b == nil {
 		return nil, ErrBodyUnavailable
@@ -392,6 +426,9 @@ func (t *Transaction) Terminate(cause error) {
 	t.mu.Lock()
 	if t.state == Active {
 		t.state = Terminated
+		if t.outcome == ExchangePending || t.outcome == ExchangeUpstreamIssued {
+			t.outcome = ExchangeAborted
+		}
 	}
 	t.mu.Unlock()
 }
@@ -405,8 +442,17 @@ func (t *Transaction) Close() error {
 	if t.state != Closed {
 		t.state = Closed
 		t.closeErr = errors.Join(t.requestBody.Close(), t.responseBody.Close())
+		if t.hasSynthetic {
+			t.closeErr = errors.Join(t.closeErr, t.synthetic.Release())
+			t.hasSynthetic = false
+			t.synthetic = SyntheticResponse{}
+		}
 		for _, lease := range []*CopyLease{t.ingressLease, t.entryLease, t.requestLease, t.originalResponseLease, t.responseLease} {
 			lease.Close()
+		}
+		if t.decisionLease != nil {
+			t.decisionLease.Close()
+			t.decisionLease = nil
 		}
 	}
 	return t.closeErr
@@ -441,6 +487,9 @@ func (t *Transaction) Snapshot(invocation InvocationID) (Input, *CopyLease, erro
 	defer t.mu.Unlock()
 	if err := t.check(t.revision); err != nil {
 		return Input{}, nil, err
+	}
+	if t.outcome == ExchangeSynthetic || t.outcome == ExchangeRejected || t.outcome == ExchangeAborted || t.phase == RequestPhase && t.outcome == ExchangeUpstreamIssued {
+		return Input{}, nil, ErrClosed
 	}
 	if invocation == "" {
 		return Input{}, nil, ErrInvalid
