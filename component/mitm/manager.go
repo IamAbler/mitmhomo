@@ -3,6 +3,7 @@
 package mitm
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
 	"net/netip"
@@ -164,6 +165,7 @@ func (m *Manager) update(config Config, prepare bool) error {
 			for _, entry := range entries {
 				if entry.Processor != nil {
 					err = errors.Join(err, entry.Processor.Close())
+					err = errors.Join(err, entry.Processor.WaitClosed(context.Background()))
 				}
 			}
 			return errors.Join(err, snapshot.config.ScriptHooks.Close())

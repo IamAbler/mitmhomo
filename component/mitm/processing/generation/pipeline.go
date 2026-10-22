@@ -21,6 +21,14 @@ type executionPin struct{ *Lease }
 
 func (p *executionPin) FinalizeExecution() { _ = p.Close() }
 
+// Processor.Close only requests shutdown. Generation completion also requires
+// explicit drain, including backend-owned workers beyond invocation admission.
+type planResources struct{ runner *pipeline.Runner }
+
+func (p planResources) Close() error {
+	return errors.Join(p.runner.Close(), p.runner.WaitClosed(context.Background()))
+}
+
 func NewPlan(entries []pipeline.Entry, resources ...io.Closer) (*Plan, error) {
 	copied := append([]pipeline.Entry(nil), entries...)
 	runner, err := pipeline.NewRunner(copied, pipeline.Options{})
@@ -28,13 +36,14 @@ func NewPlan(entries []pipeline.Entry, resources ...io.Closer) (*Plan, error) {
 		for _, e := range copied {
 			if e.Processor != nil {
 				err = errors.Join(err, e.Processor.Close())
+				err = errors.Join(err, e.Processor.WaitClosed(context.Background()))
 			}
 		}
 		g := New(resources...)
 		err = errors.Join(err, g.Close())
 		return nil, err
 	}
-	resources = append(append([]io.Closer(nil), resources...), runner)
+	resources = append(append([]io.Closer(nil), resources...), planResources{runner})
 	g := New(resources...)
 	for _, entry := range copied {
 		if err = entry.Processor.Describe().Validate(); err != nil {

@@ -185,3 +185,50 @@ func (p *syncProcessor) Start(ctx context.Context, in model.Input, resources ...
 }
 func (p *syncProcessor) Close() error                         { return p.l.Close() }
 func (p *syncProcessor) WaitClosed(ctx context.Context) error { return p.l.WaitClosed(ctx) }
+
+type drainingProcessor struct {
+	syncProcessor
+	entered, release chan struct{}
+}
+
+func (p *drainingProcessor) WaitClosed(ctx context.Context) error {
+	close(p.entered)
+	select {
+	case <-p.release:
+		return p.l.WaitClosed(ctx)
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+}
+func TestPlanWaitsForBackendDrain(t *testing.T) {
+	life, _ := processor.NewLifecycle(1)
+	backend := &drainingProcessor{syncProcessor: syncProcessor{life}, entered: make(chan struct{}), release: make(chan struct{})}
+	plan, e := NewPlan([]pipeline.Entry{{Class: pipeline.Script, Processor: backend}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	var publisher Publisher
+	publisher.Publish(plan.Generation)
+	published := make(chan struct{})
+	go func() { publisher.Publish(New()); close(published) }()
+	<-backend.entered
+	if plan.Generation.State() != Retiring {
+		t.Fatal("backend still running")
+	}
+	select {
+	case <-plan.Generation.Done():
+		t.Fatal("early closed")
+	default:
+	}
+	l, e := publisher.Bind()
+	if e != nil {
+		t.Fatal(e)
+	}
+	l.Close()
+	close(backend.release)
+	<-published
+	if plan.Generation.State() != Closed {
+		t.Fatal("not drained")
+	}
+	publisher.Close()
+}
