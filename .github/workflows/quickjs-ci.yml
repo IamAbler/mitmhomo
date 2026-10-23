@@ -52,6 +52,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go 1.26
+        id: go_setup
         # actions/setup-go v7.0.0, verified signed release commit
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
@@ -86,6 +87,18 @@ jobs:
               target="$(gcc -dumpmachine)"
               [[ "$target" == x86_64-w64-mingw32* ]]
               test "$GOOS" = "windows"
+              grep -n '#cgo windows LDFLAGS:' component/quickjs/quickjs_cgo.go || true
+              for runtime_file in \
+                libwinpthread-1.dll libpthread.a libwinpthread.a libwinpthread.dll.a; do
+                resolved="$(gcc -print-file-name="$runtime_file" | tr -d '\r')"
+                printf 'gcc_file_lookup[%s]=%s\n' "$runtime_file" "$resolved"
+                if [[ -f "$resolved" ]]; then
+                  printf 'gcc_file_exists[%s]=yes\n' "$runtime_file"
+                else
+                  printf 'gcc_file_exists[%s]=no\n' "$runtime_file"
+                fi
+              done
+              where.exe libwinpthread-1.dll || true
             elif [[ "$RUNNER_OS" == "Linux" ]]; then
               target="$(gcc -dumpmachine)"
               [[ "$target" == x86_64-linux-gnu* ]]
@@ -137,19 +150,69 @@ jobs:
             local pe_log="artifacts/quickjs-ci/${stem}-pe-imports.log"
             local imports_file="artifacts/quickjs-ci/${stem}-dll-imports.txt"
             local runtime_log="artifacts/quickjs-ci/${stem}-dll-classification.log"
+            local gcc_path=""
+            local where_output=""
+            local where_path=""
+            local archive_path=""
 
-            objdump -f "$exe" 2>&1 | tee "$arch_log"
-            grep -Fq "architecture: i386:x86-64" "$arch_log"
-            objdump -p "$exe" 2>&1 | tee "$pe_log"
-            sed -n 's/^[[:space:]]*DLL Name: //p' "$pe_log" \
-              | tr '[:upper:]' '[:lower:]' | sort -fu > "$imports_file"
-            test -s "$imports_file"
+            if [[ ! -f "$exe" || ! -s "$exe" ]]; then
+              echo "PE input is missing or empty: $exe" >&2
+              return 1
+            fi
+            if ! command -v objdump >/dev/null 2>&1; then
+              echo "objdump execution failure: executable is not available on PATH" >&2
+              return 1
+            fi
+            if ! objdump --version >/dev/null 2>&1; then
+              echo "objdump execution failure: objdump --version returned non-zero" >&2
+              return 1
+            fi
+            if objdump -f "$exe" > "$arch_log" 2>&1; then
+              cat "$arch_log"
+            else
+              cat "$arch_log" >&2
+              echo "objdump execution failure during PE inspection: objdump -f returned non-zero for $exe; a damaged PE may also cause this" >&2
+              return 1
+            fi
+            if ! grep -Eq 'file format pei-[^[:space:]]+' "$arch_log"; then
+              echo "PE validation failure: objdump ran successfully but did not recognize a PE file format for $exe; the file may be damaged or malformed" >&2
+              return 1
+            fi
+            if ! grep -Fq "file format pei-x86-64" "$arch_log"; then
+              echo "PE architecture mismatch: expected pei-x86-64" >&2
+              return 1
+            fi
+            if ! grep -Fq "architecture: i386:x86-64" "$arch_log"; then
+              echo "PE validation failure: PE format and architecture metadata are inconsistent for $exe" >&2
+              return 1
+            fi
+            if objdump -p "$exe" > "$pe_log" 2>&1; then
+              cat "$pe_log"
+            else
+              cat "$pe_log" >&2
+              echo "DLL import parsing failed: objdump -p returned non-zero for $exe" >&2
+              return 1
+            fi
+            if ! grep -Fq "The Data Directory" "$pe_log" \
+              || ! grep -Eq '^[[:space:]]*Entry[[:space:]]+1[[:space:]].*Import Directory' "$pe_log"; then
+              echo "DLL import parsing failed: objdump output lacks the PE data directory or import-directory entry for $exe" >&2
+              return 1
+            fi
+            if ! sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p' "$pe_log" \
+              | tr '[:upper:]' '[:lower:]' | sort -fu > "$imports_file"; then
+              echo "DLL import parsing failed while extracting DLL Name entries from $pe_log" >&2
+              return 1
+            fi
 
             {
               echo "Executable: $exe"
               echo "PE architecture: x86-64"
               echo "Direct DLL imports:"
-              cat "$imports_file"
+              if [[ -s "$imports_file" ]]; then
+                cat "$imports_file"
+              else
+                echo "NO_ORDINARY_DIRECT_DLL_IMPORTS (valid PE and import directory parsed; this does not prove static linking)"
+              fi
               while IFS= read -r dll; do
                 case "$dll" in
                   api-ms-win-*.dll|ext-ms-win-*.dll)
@@ -159,13 +222,35 @@ jobs:
                     printf 'WINDOWS_OS_MODULE %s (name classified; compatibility with minimum Windows release not proven by runner presence)\n' "$dll"
                     ;;
                   lib*.dll|mingw*.dll|msys-*.dll)
-                    resolved="$(gcc -print-file-name="$dll" | tr -d '\r')"
+                    gcc_path="$(gcc -print-file-name="$dll" | tr -d '\r')"
+                    where_output="$(where.exe "$dll" 2>&1 || true)"
+                    where_path="$(printf '%s\n' "$where_output" | sed -n '1p' | tr -d '\r')"
+                    resolved="$gcc_path"
                     if [[ "$resolved" == "$dll" || ! -f "$resolved" ]]; then
-                      echo "Unresolved MinGW/GCC runtime dependency: $dll -> $resolved" >&2
+                      if [[ -n "$where_path" ]] && command -v cygpath >/dev/null 2>&1; then
+                        resolved="$(cygpath -u "$where_path" 2>/dev/null || true)"
+                      fi
+                    fi
+                    printf 'GCC runtime lookup: %s -> %s\n' "$dll" "$gcc_path"
+                    printf 'PATH lookup for %s:\n%s\n' "$dll" "${where_output:-not found}"
+                    if [[ -z "$resolved" || ! -f "$resolved" ]]; then
+                      echo "Unresolved MinGW/GCC runtime dependency: $dll (GCC lookup: $gcc_path; PATH lookup: ${where_path:-not found})" >&2
                       exit 1
                     fi
-                    printf 'THIRD_PARTY_GCC_RUNTIME %s -> %s (distribution packaging decision required)\n' "$dll" "$resolved"
-                    where.exe "$dll"
+                    printf 'Resolved DLL path: %s\n' "$resolved"
+                    if [[ "$dll" == "libwinpthread-1.dll" ]]; then
+                      printf 'MINGW_PTHREAD_RUNTIME %s (QuickJS cgo configuration requests -lpthread in component/quickjs/quickjs_cgo.go; distribution packaging decision required)\n' "$dll"
+                      for archive in libpthread.a libwinpthread.a libwinpthread.dll.a; do
+                        archive_path="$(gcc -print-file-name="$archive" | tr -d '\r')"
+                        if [[ "$archive_path" != "$archive" && -f "$archive_path" ]]; then
+                          printf 'LINK_ARCHIVE_CANDIDATE %s -> %s (availability only; archive type and static link not verified)\n' "$archive" "$archive_path"
+                        else
+                          printf 'STATIC_LINK_CANDIDATE_NOT_FOUND %s -> %s\n' "$archive" "$archive_path"
+                        fi
+                      done
+                    else
+                      printf 'THIRD_PARTY_GCC_RUNTIME %s -> %s (distribution packaging decision required)\n' "$dll" "$resolved"
+                    fi
                     ;;
                   *)
                     echo "Unclassified DLL import; review provenance and target availability: $dll" >&2
@@ -176,8 +261,24 @@ jobs:
             } 2>&1 | tee "$runtime_log"
           }
 
-          inspect_pe "$test_bin" quickjs-test
-          inspect_pe "$main_bin" mihomo-main
+          inspection_failed=0
+          inspect_pe "$test_bin" quickjs-test || inspection_failed=1
+          inspect_pe "$main_bin" mihomo-main || inspection_failed=1
+          if [[ ! -f artifacts/quickjs-ci/quickjs-test-dll-imports.txt ]]; then
+            echo "QuickJS test executable DLL import result unavailable because PE inspection failed"
+          elif grep -Fxiq 'libwinpthread-1.dll' artifacts/quickjs-ci/quickjs-test-dll-imports.txt; then
+            echo "QuickJS test executable directly imports libwinpthread-1.dll"
+          else
+            echo "QuickJS test executable does not directly import libwinpthread-1.dll"
+          fi
+          if [[ ! -f artifacts/quickjs-ci/mihomo-main-dll-imports.txt ]]; then
+            echo "Main executable DLL import result unavailable because PE inspection failed"
+          elif grep -Fxiq 'libwinpthread-1.dll' artifacts/quickjs-ci/mihomo-main-dll-imports.txt; then
+            echo "Main executable directly imports libwinpthread-1.dll"
+          else
+            echo "Main executable does not directly import libwinpthread-1.dll"
+          fi
+          exit "$inspection_failed"
 
       - name: Inspect Linux shared library dependencies
         if: runner.os == 'Linux'
@@ -202,13 +303,23 @@ jobs:
           go test -asan -tags quickjs -count=1 -timeout=5m ./component/quickjs \
             2>&1 | tee artifacts/quickjs-ci/quickjs-asan.log
 
-      - name: Verify CGO-disabled stub and ordinary project build
+      - name: Run QuickJS CGO-disabled stub tests
+        if: ${{ always() && !cancelled() && steps.go_setup.outcome == 'success' }}
         env:
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
+          mkdir -p artifacts/quickjs-ci
           go test -v -tags quickjs -count=1 -timeout=3m ./component/quickjs \
             2>&1 | tee artifacts/quickjs-ci/no-cgo-stub-tests.log
+
+      - name: Build project with CGO disabled
+        if: ${{ always() && !cancelled() && steps.go_setup.outcome == 'success' }}
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/quickjs-ci
           go build -x -p 2 ./... 2>&1 \
             | tee artifacts/quickjs-ci/no-cgo-project-build.log
 
