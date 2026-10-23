@@ -140,6 +140,150 @@ func TestTransactionCloseUsesCleanupBudgetWithoutReleasingBlockedReader(t *testi
 	}
 }
 
+func TestTransactionCloseRacesParentCancellationWithoutReleasingReader(t *testing.T) {
+	reader := newControlledBody()
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(reader.release) }) }
+	defer unblock()
+	pool := NewBodyExecutionPool(1)
+	ledger := testLedger(t, -1)
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
+	broker, err := NewBodyBroker(parent, BodySource{
+		Reader: reader, Owner: FrameworkOwned, DeclaredLength: -1, Executions: pool,
+	}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, metadata := testTransaction(t, parent, ledger, NewBodySlot(broker))
+	metadata.Close()
+	prepared := make(chan error, 1)
+	go func() { prepared <- tx.PrepareBodyContext(context.Background(), FullBuffered, 16) }()
+	awaitBody(t, reader.entered)
+
+	barrier := make(chan struct{})
+	canceled := make(chan struct{})
+	closed := make(chan error, 1)
+	go func() {
+		<-barrier
+		cancelParent()
+		close(canceled)
+	}()
+	go func() {
+		<-barrier
+		closed <- tx.CloseContext(context.Background())
+	}()
+	close(barrier)
+	awaitBody(t, canceled)
+	if err = awaitBody(t, closed); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("concurrent Close did not honor its cleanup budget: %v", err)
+	}
+	if tx.State() != Closed || reader.closes.Load() != 0 || pool.Occupied() != 1 {
+		t.Fatal("concurrent cancellation released a live Reader owner")
+	}
+	assertBodyOpen(t, broker.ExecutionDone())
+
+	unblock()
+	if err = awaitBody(t, prepared); !errors.Is(err, context.Canceled) {
+		t.Fatalf("late Body operation lost cancellation: %v", err)
+	}
+	awaitBody(t, broker.ExecutionDone())
+	if err = tx.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reader.closes.Load() != 1 || pool.Occupied() != 0 || ledger.Current() != 0 {
+		t.Fatal("concurrent cancellation and Close leaked or duplicated resources")
+	}
+}
+
+type erroringStreamBody struct {
+	entered, release chan struct{}
+	err              error
+	reads, closes    atomic.Int32
+	once             sync.Once
+}
+
+type countedExecutionCloser struct{ closes *atomic.Int32 }
+
+func (closer countedExecutionCloser) Close() error {
+	closer.closes.Add(1)
+	return nil
+}
+
+func (body *erroringStreamBody) Read(p []byte) (int, error) {
+	if body.reads.Add(1) != 1 {
+		return 0, io.EOF
+	}
+	return copy(p, "part"), body.err
+}
+
+func (body *erroringStreamBody) Close() error {
+	body.closes.Add(1)
+	body.once.Do(func() { close(body.entered) })
+	<-body.release
+	return nil
+}
+
+func TestStreamingReadErrorReturnsBeforePhysicalSourceClose(t *testing.T) {
+	readErr := errors.New("controlled stream read error")
+	reader := &erroringStreamBody{entered: make(chan struct{}), release: make(chan struct{}), err: readErr}
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(reader.release) }) }
+	defer unblock()
+	pool := NewBodyExecutionPool(1)
+	ledger := testLedger(t, -1)
+	var executionClosed atomic.Int32
+	broker, err := NewBodyBroker(context.Background(), BodySource{
+		Reader: reader, Owner: TransportOwned, DeclaredLength: -1, Executions: pool,
+		AcquireExecution: func() (io.Closer, error) { return countedExecutionCloser{closes: &executionClosed}, nil },
+	}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream, err := broker.TakeStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type readResult struct {
+		n   int
+		err error
+	}
+	readReturned := make(chan readResult, 1)
+	go func() {
+		buffer := make([]byte, 16)
+		n, readErr := stream.Read(buffer)
+		readReturned <- readResult{n: n, err: readErr}
+	}()
+	awaitBody(t, reader.entered)
+	var result readResult
+	select {
+	case result = <-readReturned:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("streaming Read waited for the source's physical Close")
+	}
+	if result.n != len("part") || !errors.Is(result.err, readErr) {
+		t.Fatalf("Read returned (%d, %v), want partial bytes and the source error", result.n, result.err)
+	}
+	assertBodyOpen(t, broker.ExecutionDone())
+	if reader.closes.Load() != 1 || executionClosed.Load() != 0 || pool.Occupied() != 1 {
+		t.Fatal("failed stream read released its physical source owner early")
+	}
+	closeCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	if err = broker.CloseContext(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		cancel()
+		t.Fatalf("CloseContext did not bound the blocked disposer: %v", err)
+	}
+	cancel()
+	unblock()
+	awaitBody(t, broker.ExecutionDone())
+	if err = broker.CloseContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if executionClosed.Load() != 1 || pool.Occupied() != 0 || ledger.Current() != 0 {
+		t.Fatal("late streaming cleanup leaked its Body or Execution owner")
+	}
+}
+
 func TestTransactionBodyIOTimeoutIsAppliedOutsidePipeline(t *testing.T) {
 	reader := newControlledBody()
 	var release sync.Once

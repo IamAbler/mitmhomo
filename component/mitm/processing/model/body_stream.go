@@ -80,15 +80,16 @@ func (b *BodyBroker) readStream(op *bodyOperation, p []byte) (int, error) {
 	}
 	op.reading = true
 	b.mu.Unlock()
-	n, err := op.work.read(op.ctx, p)
+	n, err := op.work.readStream(op.ctx, p)
 	b.mu.Lock()
 	// Keep the read flag until the closing owner is settled, so Close cannot
 	// start a second drain concurrently with this final access to bodyData.
 	canceled := b.closing || op.canceled != nil || op.ctx.Err() != nil || b.ownerContext.Err() != nil || b.ctx.Err() != nil
 	if canceled || err != nil && err != io.EOF {
-		b.mu.Unlock()
 		if canceled {
-			if op.ctx.Err() != nil {
+			if op.canceled != nil {
+				err = op.canceled
+			} else if op.ctx.Err() != nil {
 				err = context.Cause(op.ctx)
 			} else if b.ownerContext.Err() != nil {
 				err = context.Cause(b.ownerContext)
@@ -98,7 +99,17 @@ func (b *BodyBroker) readStream(op *bodyOperation, p []byte) (int, error) {
 				err = ErrReleased
 			}
 		}
-		b.finishOperation(op, nil, n, err)
+		// The source is still exclusively owned by this operation. Revoke new
+		// reads and publish the logical result now, then let the already-reserved
+		// owner worker perform physical Close and release its pins/capacity.
+		b.closing = true
+		if !op.logicalClosed {
+			op.err = err
+			op.logicalClosed = true
+			close(op.logical)
+		}
+		b.mu.Unlock()
+		b.dispatchBodyClose(op)
 		return n, err
 	}
 	op.reading = false

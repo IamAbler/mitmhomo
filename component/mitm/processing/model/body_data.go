@@ -246,6 +246,42 @@ func (b *bodyData) read(ctx context.Context, p []byte) (int, error) {
 	return n, err
 }
 
+// readStream keeps disposal with BodyBroker's reserved owner worker. The
+// caller borrows p and may be an HTTP handler, so a source error must not make
+// that caller synchronously wait on an arbitrary source.Close implementation.
+func (b *bodyData) readStream(ctx context.Context, p []byte) (int, error) {
+	if b.state == Released {
+		return 0, ErrReleased
+	}
+	if b.state == Faulted {
+		return 0, b.fault
+	}
+	if err := b.contextErr(ctx); err != nil {
+		b.state = Faulted
+		b.fault = err
+		b.dropBuffer()
+		return 0, err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.position < len(b.data) {
+		n := copy(p, b.data[b.position:])
+		b.position += n
+		return n, nil
+	}
+	if b.state == FullBufferedState || b.state == Replaced || b.eof {
+		return 0, io.EOF
+	}
+	n, err := b.readSource(ctx, p)
+	if err != nil && err != io.EOF {
+		b.state = Faulted
+		b.fault = err
+		b.dropBuffer()
+	}
+	return n, err
+}
+
 func (b *bodyData) close() error {
 	if b == nil {
 		return nil
