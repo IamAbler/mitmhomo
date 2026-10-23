@@ -1,0 +1,223 @@
+name: QuickJS M6.1 CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - validation/m61-quickjs-ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quickjs-m61-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quickjs:
+    name: QuickJS CGO / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+            goos: linux
+            exe_suffix: ""
+          - runner: windows-2025
+            platform: windows-amd64
+            goos: windows
+            exe_suffix: .exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: "1"
+      CC: gcc
+      GOOS: ${{ matrix.goos }}
+      GOARCH: amd64
+      GOTOOLCHAIN: local
+      MSYS_NO_PATHCONV: "1"
+      SKIP_INTEROP_TEST: "1"
+      TEST_EXE_SUFFIX: ${{ matrix.exe_suffix }}
+
+    steps:
+      - name: Checkout
+        # actions/checkout v7.0.1, verified signed release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go 1.26
+        # actions/setup-go v7.0.0, verified signed release commit
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.26"
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          cache: false
+
+      - name: Verify native compiler and linker
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/quickjs-ci
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "CC=$CC"
+            echo "GOOS=$GOOS"
+            echo "GOARCH=$GOARCH"
+            go version
+            go env
+            test "$(go env CGO_ENABLED)" = "1"
+            test "$(go env GOOS)" = "$GOOS"
+            test "$(go env GOARCH)" = "amd64"
+            test "$(go env CC)" = "$CC"
+            command -v "$CC"
+            gcc --version
+            gcc -dumpmachine
+            gcc -print-search-dirs
+            ld --version
+            objdump --version
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              where.exe gcc
+              target="$(gcc -dumpmachine)"
+              [[ "$target" == x86_64-w64-mingw32* ]]
+              test "$GOOS" = "windows"
+            elif [[ "$RUNNER_OS" == "Linux" ]]; then
+              target="$(gcc -dumpmachine)"
+              [[ "$target" == x86_64-linux-gnu* ]]
+              test "$GOOS" = "linux"
+            else
+              echo "Unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+            fi
+          } 2>&1 | tee artifacts/quickjs-ci/toolchain.log
+
+      - name: Build QuickJS package test executable
+        run: |
+          set -euo pipefail
+          test_bin="artifacts/quickjs-ci/quickjs-package.test${TEST_EXE_SUFFIX}"
+          go test -x -c -tags quickjs -o "$test_bin" ./component/quickjs 2>&1 \
+            | tee artifacts/quickjs-ci/quickjs-build.log
+
+      - name: Run QuickJS lifecycle and feature tests
+        run: |
+          set -euo pipefail
+          test_bin="artifacts/quickjs-ci/quickjs-package.test${TEST_EXE_SUFFIX}"
+          "$test_bin" -test.v -test.count=1 -test.timeout=3m 2>&1 \
+            | tee artifacts/quickjs-ci/quickjs-tests.log
+
+      - name: Build every package with QuickJS enabled
+        run: |
+          set -euo pipefail
+          go build -x -p 2 -tags quickjs ./... 2>&1 \
+            | tee artifacts/quickjs-ci/quickjs-project-build.log
+
+      - name: Build final mitmhomo executable with QuickJS tag
+        run: |
+          set -euo pipefail
+          main_bin="artifacts/quickjs-ci/mihomo-quickjs${TEST_EXE_SUFFIX}"
+          go build -x -tags quickjs -o "$main_bin" . 2>&1 \
+            | tee artifacts/quickjs-ci/quickjs-main-build.log
+          "$main_bin" -v 2>&1 | tee artifacts/quickjs-ci/quickjs-main-smoke.log
+
+      - name: Inspect Windows PE architecture and DLL dependencies
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          test_bin="artifacts/quickjs-ci/quickjs-package.test${TEST_EXE_SUFFIX}"
+          main_bin="artifacts/quickjs-ci/mihomo-quickjs${TEST_EXE_SUFFIX}"
+          inspect_pe() {
+            local exe="$1"
+            local stem="$2"
+            local arch_log="artifacts/quickjs-ci/${stem}-pe-architecture.log"
+            local pe_log="artifacts/quickjs-ci/${stem}-pe-imports.log"
+            local imports_file="artifacts/quickjs-ci/${stem}-dll-imports.txt"
+            local runtime_log="artifacts/quickjs-ci/${stem}-dll-classification.log"
+
+            objdump -f "$exe" 2>&1 | tee "$arch_log"
+            grep -Fq "architecture: i386:x86-64" "$arch_log"
+            objdump -p "$exe" 2>&1 | tee "$pe_log"
+            sed -n 's/^[[:space:]]*DLL Name: //p' "$pe_log" \
+              | tr '[:upper:]' '[:lower:]' | sort -fu > "$imports_file"
+            test -s "$imports_file"
+
+            {
+              echo "Executable: $exe"
+              echo "PE architecture: x86-64"
+              echo "Direct DLL imports:"
+              cat "$imports_file"
+              while IFS= read -r dll; do
+                case "$dll" in
+                  api-ms-win-*.dll|ext-ms-win-*.dll)
+                    printf 'WINDOWS_API_SET_CONTRACT %s (minimum target OS not validated)\n' "$dll"
+                    ;;
+                  advapi32.dll|bcrypt.dll|cfgmgr32.dll|comdlg32.dll|crypt32.dll|dnsapi.dll|gdi32.dll|iphlpapi.dll|kernel32.dll|kernelbase.dll|msvcrt.dll|netapi32.dll|ntdll.dll|ole32.dll|oleaut32.dll|powrprof.dll|psapi.dll|rpcrt4.dll|secur32.dll|setupapi.dll|shell32.dll|shlwapi.dll|user32.dll|userenv.dll|version.dll|winhttp.dll|wininet.dll|winmm.dll|ws2_32.dll|wtsapi32.dll|ucrtbase.dll)
+                    printf 'WINDOWS_OS_MODULE %s (name classified; compatibility with minimum Windows release not proven by runner presence)\n' "$dll"
+                    ;;
+                  lib*.dll|mingw*.dll|msys-*.dll)
+                    resolved="$(gcc -print-file-name="$dll" | tr -d '\r')"
+                    if [[ "$resolved" == "$dll" || ! -f "$resolved" ]]; then
+                      echo "Unresolved MinGW/GCC runtime dependency: $dll -> $resolved" >&2
+                      exit 1
+                    fi
+                    printf 'THIRD_PARTY_GCC_RUNTIME %s -> %s (distribution packaging decision required)\n' "$dll" "$resolved"
+                    where.exe "$dll"
+                    ;;
+                  *)
+                    echo "Unclassified DLL import; review provenance and target availability: $dll" >&2
+                    exit 1
+                    ;;
+                esac
+              done < "$imports_file"
+            } 2>&1 | tee "$runtime_log"
+          }
+
+          inspect_pe "$test_bin" quickjs-test
+          inspect_pe "$main_bin" mihomo-main
+
+      - name: Inspect Linux shared library dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for binary in \
+            artifacts/quickjs-ci/quickjs-package.test \
+            artifacts/quickjs-ci/mihomo-quickjs; do
+            ldd "$binary" 2>&1 | tee "artifacts/quickjs-ci/$(basename "$binary")-ldd.log"
+            if grep -Fq 'not found' "artifacts/quickjs-ci/$(basename "$binary")-ldd.log"; then
+              echo "Unresolved shared library for $binary" >&2
+              exit 1
+            fi
+          done
+
+      - name: Run Linux race and AddressSanitizer checks
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          go test -race -tags quickjs -count=20 -timeout=8m ./component/quickjs \
+            2>&1 | tee artifacts/quickjs-ci/quickjs-race.log
+          go test -asan -tags quickjs -count=1 -timeout=5m ./component/quickjs \
+            2>&1 | tee artifacts/quickjs-ci/quickjs-asan.log
+
+      - name: Verify CGO-disabled stub and ordinary project build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          go test -v -tags quickjs -count=1 -timeout=3m ./component/quickjs \
+            2>&1 | tee artifacts/quickjs-ci/no-cgo-stub-tests.log
+          go build -x -p 2 ./... 2>&1 \
+            | tee artifacts/quickjs-ci/no-cgo-project-build.log
+
+      - name: Upload build logs and diagnostics
+        if: always()
+        # actions/upload-artifact v7.0.2, verified signed release commit
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: quickjs-m61-${{ matrix.platform }}-${{ github.run_id }}
+          path: artifacts/quickjs-ci/
+          if-no-files-found: warn
+          retention-days: 14
