@@ -259,6 +259,19 @@ func normalizeBodyNeed(enabled bool, need *model.BodyNeed, limit *int64) error {
 	return nil
 }
 
+// ParseBodyNeed parses the deliberately small YAML-facing body policy. Empty
+// input and "none" preserve streaming; full buffering requires explicit opt-in.
+func ParseBodyNeed(value string) (model.BodyNeed, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "none":
+		return model.None, nil
+	case "full-buffered":
+		return model.FullBuffered, nil
+	default:
+		return model.None, fmt.Errorf("must be none or full-buffered")
+	}
+}
+
 func compileError(id string, err error) error {
 	kind := model.ProcessingErrorCompile
 	if errors.Is(err, jsruntime.ErrResourceLimit) {

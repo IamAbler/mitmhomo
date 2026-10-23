@@ -26,6 +26,7 @@ type RawMITM struct {
 	IdleTimeout        int           `yaml:"idle-timeout" json:"idle-timeout"`
 	Rewrite            RawRewrite    `yaml:"rewrite" json:"rewrite"`
 	HTTPScript         RawHTTPScript `yaml:"http-script" json:"http-script"`
+	GojaProcessor      RawGoja       `yaml:"goja-processor" json:"goja-processor"`
 }
 
 func parseMITM(raw RawMITM) (*mitm.Config, error) {
@@ -111,6 +112,10 @@ func parseMITM(raw RawMITM) (*mitm.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mitm.http-script: %w", err)
 	}
+	gojaFactory, err := parseMITMGoja(raw.GojaProcessor)
+	if err != nil {
+		return nil, fmt.Errorf("mitm.goja-processor: %w", err)
+	}
 	certificate, err := mitm.LoadCertificateAuthority(raw.CACertificate, raw.CAPrivateKey)
 	if err != nil {
 		return nil, err
@@ -119,6 +124,7 @@ func parseMITM(raw RawMITM) (*mitm.Config, error) {
 		Enabled:            true,
 		Rewrite:            rewriteSnapshot,
 		ScriptHooks:        httpScriptSnapshot,
+		ProcessorFactory:   gojaFactory,
 		PortRanges:         ports,
 		Domains:            domains,
 		CA:                 certificate,
