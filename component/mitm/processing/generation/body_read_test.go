@@ -206,10 +206,11 @@ func TestBodyReadInvocationAndGenerationRetireRaceKeepsBothOwners(t *testing.T) 
 	next := New()
 	barrier := make(chan struct{})
 	var race sync.WaitGroup
-	race.Add(3)
+	race.Add(4)
 	go func() { defer race.Done(); <-barrier; _ = publisher.Publish(next) }()
 	go func() { defer race.Done(); <-barrier; connection.Close(); stream.Close() }()
 	go func() { defer race.Done(); <-barrier; cancel() }()
+	go func() { defer race.Done(); <-barrier; tx.CloseLogical() }()
 	close(barrier)
 	race.Wait()
 	select {

@@ -23,6 +23,30 @@ var (
 	errProcessingAborted  = errors.New("HTTP processing aborted")
 )
 
+// logicalTransactionBody adapts a Transaction-owned Body to net/http's
+// ReadCloser contract. Close revokes this phase's Body immediately; physical
+// source disposal stays with the Body owner and may finish after this returns.
+type logicalTransactionBody struct {
+	io.ReadCloser
+	tx    *model.Transaction
+	phase model.Phase
+	once  sync.Once
+}
+
+func (body *logicalTransactionBody) Close() error {
+	if body == nil {
+		return nil
+	}
+	body.once.Do(func() {
+		if body.tx != nil {
+			body.tx.CloseBodyLogical(body.phase)
+		} else if body.ReadCloser != nil {
+			_ = body.ReadCloser.Close()
+		}
+	})
+	return nil
+}
+
 type responseHookFramingKey struct{}
 
 type responseHookFraming struct {
@@ -231,22 +255,15 @@ func newRequestTransaction(
 		OriginalIngress: originalHead, Request: entryHead, RequestBody: bodySlot, Ledger: ledger,
 	})
 	if err != nil {
-		_ = bodySlot.Close()
+		bodySlot.CloseLogical()
 		return nil, err
 	}
 	return tx, nil
 }
 
-func enterUpstreamResponse(tx *model.Transaction, response *http.Response, stream *generation.Lease) error {
+func enterUpstreamResponse(tx *model.Transaction, response *http.Response, stream *generation.Lease, interrupt func()) error {
 	if tx == nil || response == nil || stream == nil {
 		return model.ErrInvalid
-	}
-	ledger := tx.Ledger()
-	copyLease := model.NewCopyLease(ledger)
-	defer copyLease.Close()
-	head, err := makeResponseHead(copyLease, response, false)
-	if err != nil {
-		return err
 	}
 	body := response.Body
 	if body == nil {
@@ -258,9 +275,10 @@ func enterUpstreamResponse(tx *model.Transaction, response *http.Response, strea
 	} else if declaredLength < 0 {
 		declaredLength = -1
 	}
+	ledger := tx.Ledger()
 	broker, err := model.NewBodyBroker(tx.Context(), model.BodySource{
 		Reader: body, Owner: model.TransportOwned, DeclaredLength: declaredLength,
-		Interrupt: func() { _ = body.Close() },
+		Interrupt: interrupt,
 		SnapshotTrailers: func(lease *model.CopyLease) (model.TrailerView, error) {
 			return makeHTTPTrailers(lease, response.Trailer, true)
 		},
@@ -270,8 +288,19 @@ func enterUpstreamResponse(tx *model.Transaction, response *http.Response, strea
 		return err
 	}
 	bodySlot := model.NewBodySlot(broker)
+	// ReverseProxy closes Response.Body itself when ModifyResponse fails. Move
+	// the accepted source under BodyBroker ownership before any fallible response
+	// head/pipeline work, so its bounded owner can dispose it asynchronously.
+	response.Body = http.NoBody
+	copyLease := model.NewCopyLease(ledger)
+	defer copyLease.Close()
+	head, err := makeResponseHead(copyLease, response, false)
+	if err != nil {
+		bodySlot.CloseLogical()
+		return err
+	}
 	if err := tx.EnterResponse(tx.Revision(), head, head, bodySlot, model.OriginUpstream); err != nil {
-		_ = bodySlot.Close()
+		bodySlot.CloseLogical()
 		return err
 	}
 	return nil
@@ -319,6 +348,7 @@ func applyRequestTransaction(request *http.Request, tx *model.Transaction) (mode
 	if err != nil {
 		return info, err
 	}
+	requestBody = &logicalTransactionBody{ReadCloser: requestBody, tx: tx, phase: model.RequestPhase}
 	if info.State == model.Replaced || info.State == model.FullBufferedState {
 		request.ContentLength = info.Length
 	}
@@ -443,6 +473,7 @@ func applyResponseTransaction(response *http.Response, tx *model.Transaction, do
 	if err != nil {
 		return err
 	}
+	body = &logicalTransactionBody{ReadCloser: body, tx: tx, phase: model.ResponsePhase}
 	suppressBody := downstreamMethod == http.MethodHead || responseForbidsBody(head.Status)
 	bodyUnavailable := originalBodyUnavailable && info.State != model.Replaced
 	if suppressBody || bodyUnavailable {

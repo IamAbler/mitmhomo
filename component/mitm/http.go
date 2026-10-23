@@ -344,7 +344,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 			},
 			Rewrite: func(*httputil.ProxyRequest) {},
 			ModifyResponse: func(response *http.Response) error {
-				if err := enterUpstreamResponse(tx, response, stream); err != nil {
+				if err := enterUpstreamResponse(tx, response, stream, func() { cancel(context.Canceled) }); err != nil {
 					return err
 				}
 				responseReport, err := processing.Run(requestCtx, tx, model.ResponsePhase)

@@ -449,6 +449,27 @@ func (t *Transaction) BodyExecutionDone() <-chan struct{} {
 	return NewBodySlot(t.bodyLocked()).ExecutionDone()
 }
 
+// CloseBodyLogical closes admission for one phase's Body without terminating
+// the Transaction or waiting for the source's physical Read/Close to finish.
+// The Body owner keeps its resources and Execution pin until actual disposal.
+func (t *Transaction) CloseBodyLogical(phase Phase) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	var broker *BodyBroker
+	switch phase {
+	case RequestPhase:
+		broker = t.requestBody.broker
+	case ResponsePhase:
+		broker = t.responseBody.broker
+	}
+	t.mu.Unlock()
+	if broker != nil {
+		broker.CloseLogical()
+	}
+}
+
 // PrepareBodyContext transfers optional execution pins to the Body owner. Pins
 // survive logical timeout and are released only after physical Body disposal.
 func (t *Transaction) PrepareBodyContext(ctx context.Context, need BodyNeed, limit int64, resources ...io.Closer) error {

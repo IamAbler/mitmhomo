@@ -16,6 +16,7 @@ import (
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/mitm/httphook"
+	"github.com/metacubex/mihomo/component/mitm/processing/generation"
 	"github.com/metacubex/mihomo/component/mitm/processing/gojaprocessor"
 	"github.com/metacubex/mihomo/component/mitm/processing/model"
 	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
@@ -267,6 +268,270 @@ func TestM52GojaTimeoutAndBodyLimitHTTPMappings(t *testing.T) {
 		require.NotContains(t, body, "unknown-internal-value")
 		require.NotContains(t, body, "private")
 	})
+}
+
+func TestM52ResponseBodyTimeoutCancelsOnlyTheOwningRequest(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		name := "http11"
+		if h2 {
+			name = "http2"
+		}
+		t.Run(name, func(t *testing.T) {
+			streamed := make(chan struct{})
+			upstreamCanceled := make(chan struct{})
+			upstreamDone := make(chan struct{})
+			var upstreamCalls atomic.Int32
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+			h := m52ProtocolHarness(t, h2, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				upstreamCalls.Add(1)
+				if request.URL.Path != "/blocked" {
+					_, _ = io.WriteString(w, "sibling-ok")
+					return
+				}
+				defer close(upstreamDone)
+				_, _ = io.WriteString(w, "partial")
+				w.(http.Flusher).Flush()
+				close(streamed)
+				go func() {
+					<-request.Context().Done()
+					close(upstreamCanceled)
+				}()
+				// Deliberately ignore request cancellation until the test releases
+				// this upstream handler. The proxy must still return its timeout.
+				<-release
+			}), m52GojaFactory(t, gojaprocessor.Config{
+				ID: "m52-response-body-cancel", Source: `function process(input) { return {kind:"continue"}; }`,
+				Response: true, ResponseBody: model.FullBuffered, ResponseMaxBodyBytes: 1 << 20,
+				TotalTimeout: 150 * time.Millisecond,
+			}))
+			// Register after the harness cleanup so a failing assertion releases
+			// the deliberately blocked upstream before httptest.Server.Close waits.
+			t.Cleanup(releaseUpstream)
+
+			type roundTripResult struct {
+				response *http.Response
+				err      error
+			}
+			request, err := http.NewRequest(http.MethodGet, "https://localhost/blocked", nil)
+			require.NoError(t, err)
+			result := make(chan roundTripResult, 1)
+			go func() {
+				var response *http.Response
+				var roundTripErr error
+				if h2 {
+					response, roundTripErr = h.client.RoundTrip(request)
+				} else {
+					response, roundTripErr = h.wire.RoundTrip(request)
+				}
+				result <- roundTripResult{response: response, err: roundTripErr}
+			}()
+			select {
+			case <-streamed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("upstream did not start streaming the blocked response")
+			}
+			var response *http.Response
+			select {
+			case received := <-result:
+				require.NoError(t, received.err)
+				response = received.response
+			case <-time.After(3 * time.Second):
+				t.Fatal("response Body Close blocked the timed-out HTTP handler")
+			}
+			require.Equal(t, http.StatusGatewayTimeout, response.StatusCode)
+			require.Contains(t, m52ReadResponse(t, response), "timed out")
+			select {
+			case <-upstreamCanceled:
+			case <-time.After(3 * time.Second):
+				t.Fatal("response body cancellation did not reach its upstream request")
+			}
+			if h2 {
+				sibling := m52RoundTrip(t, h, true, http.MethodGet, "/sibling", "")
+				require.Equal(t, "sibling-ok", m52ReadResponse(t, sibling), "canceling one stream must preserve its HTTP/2 sibling")
+				require.EqualValues(t, 2, upstreamCalls.Load(), "each downstream stream must issue exactly one upstream exchange")
+			} else {
+				require.EqualValues(t, 1, upstreamCalls.Load(), "a response pipeline timeout must not retry the upstream exchange")
+			}
+			releaseUpstream()
+			select {
+			case <-upstreamDone:
+			case <-time.After(3 * time.Second):
+				t.Fatal("test upstream did not exit after release")
+			}
+		})
+	}
+}
+
+func TestCommitTrackingWriterRecognizesHTTPCommitBoundaries(t *testing.T) {
+	t.Run("final headers commit without a body", func(t *testing.T) {
+		for _, status := range []int{http.StatusOK, http.StatusNoContent, http.StatusNotModified} {
+			recorder := httptest.NewRecorder()
+			writer := &commitTrackingWriter{ResponseWriter: recorder}
+			writer.WriteHeader(status)
+			require.Truef(t, writer.Committed(), "status %d must commit even without a Body write", status)
+			require.Equal(t, status, recorder.Code)
+		}
+	})
+
+	t.Run("informational headers do not commit the final response", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		writer := &commitTrackingWriter{ResponseWriter: recorder}
+		writer.WriteHeader(http.StatusEarlyHints)
+		require.False(t, writer.Committed())
+	})
+
+	t.Run("empty Write and Flush commit implicitly", func(t *testing.T) {
+		for _, commit := range []struct {
+			name string
+			call func(*commitTrackingWriter) error
+		}{
+			{name: "empty write", call: func(writer *commitTrackingWriter) error { _, err := writer.Write(nil); return err }},
+			{name: "flush", call: func(writer *commitTrackingWriter) error { return writer.FlushError() }},
+		} {
+			t.Run(commit.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				writer := &commitTrackingWriter{ResponseWriter: recorder}
+				require.NoError(t, commit.call(writer))
+				require.True(t, writer.Committed())
+				require.Equal(t, http.StatusOK, recorder.Code)
+				if commit.name == "flush" {
+					require.True(t, recorder.Flushed)
+				}
+			})
+		}
+	})
+
+	for _, commit := range []struct {
+		name     string
+		write    func(*commitTrackingWriter) error
+		wantBody string
+	}{
+		{name: "WriteHeader without Body", write: func(writer *commitTrackingWriter) error { writer.WriteHeader(http.StatusOK); return nil }},
+		{name: "partial Write", write: func(writer *commitTrackingWriter) error { _, err := writer.Write([]byte("partial")); return err }, wantBody: "partial"},
+		{name: "Flush without Body", write: func(writer *commitTrackingWriter) error { return writer.FlushError() }},
+	} {
+		t.Run("failure after "+commit.name+" aborts instead of writing a second response", func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writer := &commitTrackingWriter{ResponseWriter: recorder}
+			require.NoError(t, commit.write(writer))
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				writeProcessingFailure(writer, request, model.ErrInvalid, model.ResponsePhase)
+			}()
+			require.Equal(t, http.ErrAbortHandler, recovered)
+			require.Equal(t, http.StatusOK, recorder.Code)
+			require.Equal(t, commit.wantBody, recorder.Body.String())
+		})
+	}
+}
+
+type m52BlockedCloseBody struct {
+	entered chan struct{}
+	release <-chan struct{}
+	closed  atomic.Int32
+	once    sync.Once
+}
+
+func (*m52BlockedCloseBody) Read([]byte) (int, error) { return 0, io.EOF }
+func (body *m52BlockedCloseBody) Close() error {
+	body.closed.Add(1)
+	body.once.Do(func() { close(body.entered) })
+	<-body.release
+	return nil
+}
+
+func TestM52ResponseBodyCloseReturnsBeforePhysicalDisposal(t *testing.T) {
+	g := generation.New()
+	require.NoError(t, g.Activate())
+	connection, err := g.Bind()
+	require.NoError(t, err)
+	stream, err := connection.Transaction()
+	require.NoError(t, err)
+	ledger, err := model.NewLedger(-1, nil)
+	require.NoError(t, err)
+	lease := model.NewCopyLease(ledger)
+	requestURL, err := model.ParseURL(lease, "https://localhost/", model.MITMHTTPS)
+	require.NoError(t, err)
+	requestHeaders, err := model.NewHeaderBlock(lease, nil)
+	require.NoError(t, err)
+	requestHead := model.RequestHead{Method: http.MethodGet, URL: requestURL, Authority: "localhost", Headers: requestHeaders}
+	tx, err := model.NewTransaction(context.Background(), model.TransactionOptions{
+		ID: "m52-response-close", Generation: g.ID(), Connection: model.ConnectionView{ID: "m52-connection"},
+		OriginalIngress: requestHead, Request: requestHead, Ledger: ledger,
+	})
+	lease.Close()
+	require.NoError(t, err)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBody := func() { releaseOnce.Do(func() { close(release) }) }
+	body := &m52BlockedCloseBody{entered: make(chan struct{}), release: release}
+	defer func() {
+		releaseBody()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = tx.CloseContext(ctx)
+		_ = stream.Close()
+		_ = connection.Close()
+		g.Retire()
+		_ = g.WaitClosed(ctx)
+	}()
+	response := &http.Response{
+		StatusCode: http.StatusOK, Header: make(http.Header), Trailer: make(http.Header),
+		ContentLength: -1, Body: body, Request: httptest.NewRequest(http.MethodGet, "https://localhost/", nil),
+	}
+	require.NoError(t, enterUpstreamResponse(tx, response, stream, func() {}))
+	require.Equal(t, http.NoBody, response.Body, "ReverseProxy must not close the raw source while the Transaction owns it")
+	require.NoError(t, applyResponseTransaction(response, tx, http.MethodGet))
+
+	closed := make(chan error, 1)
+	go func() { closed <- response.Body.Close() }()
+	select {
+	case <-body.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("response Body owner did not begin physical disposal")
+	}
+	var closeBlocked bool
+	select {
+	case closeErr := <-closed:
+		require.NoError(t, closeErr)
+	case <-time.After(time.Second):
+		closeBlocked = true
+	}
+	if closeBlocked {
+		t.Fatal("HTTP Response.Body.Close waited for physical Body disposal")
+	}
+	select {
+	case <-tx.BodyExecutionDone():
+		t.Fatal("logical HTTP Body close forged physical ExecutionDone")
+	default:
+	}
+	_ = stream.Close()
+	_ = connection.Close()
+	g.Retire()
+	wait, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	err = g.WaitClosed(wait)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) || g.State() != generation.Retiring {
+		t.Fatalf("Generation retired while response Body.Close was still running: state=%v err=%v", g.State(), err)
+	}
+	releaseBody()
+	select {
+	case <-tx.BodyExecutionDone():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Body ExecutionDone did not follow physical disposal")
+	}
+	wait, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err = g.WaitClosed(wait); err != nil {
+		t.Fatal(err)
+	}
+	if body.closed.Load() != 1 {
+		t.Fatalf("source Close count = %d, want 1", body.closed.Load())
+	}
 }
 
 func TestM52ProcessingFailureErrorMappings(t *testing.T) {
