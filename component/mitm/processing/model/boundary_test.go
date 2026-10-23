@@ -49,10 +49,15 @@ func TestModelDependencyBoundary(t *testing.T) {
 	if bodyLaunches != 3 {
 		t.Fatalf("Body launch sites changed: %d", bodyLaunches)
 	}
-	// The processor, pipeline, generation and backend-adapter layers are
-	// intentional production dependencies on the model. No protocol, engine, or
-	// unrelated production package may import it.
+	// The processor, pipeline, generation, backend, and these three explicit
+	// HTTP/configuration adapter files are intentional production dependencies
+	// on the model. No unrelated production package may import it.
 	const target = "github.com/metacubex/mihomo/component/mitm/processing/model"
+	allowedAdapters := map[string]struct{}{
+		filepath.Join("component", "mitm", "http.go"):                {},
+		filepath.Join("component", "mitm", "processing_adapters.go"): {},
+		filepath.Join("component", "mitm", "processing_http.go"):     {},
+	}
 	root := filepath.Clean("../../../..")
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -74,7 +79,13 @@ func TestModelDependencyBoundary(t *testing.T) {
 		for _, spec := range file.Imports {
 			name, _ := strconv.Unquote(spec.Path.Value)
 			if name == target {
-				t.Errorf("model connected to production path: %s", path)
+				relative, relErr := filepath.Rel(root, path)
+				if relErr != nil {
+					return relErr
+				}
+				if _, allowed := allowedAdapters[relative]; !allowed {
+					t.Errorf("model imported outside framework or HTTP adapter layers: %s", path)
+				}
 			}
 		}
 		return nil

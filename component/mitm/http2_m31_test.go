@@ -47,7 +47,7 @@ func newH2HarnessTarget(t *testing.T, manager *Manager, targetHost string, targe
 	return newProtocolHarness(t, manager, targetHost, targetPort, upstreamHandler, failDial, trust, true, []string{"http/1.1"}, options...)
 }
 
-func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targetPort uint16, upstreamHandler http.Handler, failDial, trust, downstreamH2 bool, protocols []string, options ...func(*Config)) *h2Harness {
+func newProtocolHarness(t testing.TB, manager *Manager, targetHost string, targetPort uint16, upstreamHandler http.Handler, failDial, trust, downstreamH2 bool, protocols []string, options ...func(*Config)) *h2Harness {
 	t.Helper()
 	h := &h2Harness{done: make(chan dispatchResult, 1)}
 	cert, roots := makeTestUpstreamCertificateFor(t, targetHost)
@@ -91,7 +91,7 @@ func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targe
 			// for the new downstream snapshot, retaining the old snapshot roots.
 			next := manager.ConfigSnapshot()
 			next.upstreamRootCAs = roots
-			manager.Update(next)
+			require.NoError(t, manager.Update(next))
 		}
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -163,11 +163,14 @@ func newProtocolHarness(t *testing.T, manager *Manager, targetHost string, targe
 			t.Error("H2 dispatcher leaked")
 		}
 		require.Eventually(t, func() bool { return h.active.Load() == 0 }, 3*time.Second, 10*time.Millisecond, "upstream connections leaked")
+		if manager == nil {
+			require.NoError(t, h.manager.Close())
+		}
 	})
 	return h
 }
 
-func h2Request(t *testing.T, h *h2Harness, method, path, body string) *http.Response {
+func h2Request(t testing.TB, h *h2Harness, method, path, body string) *http.Response {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)

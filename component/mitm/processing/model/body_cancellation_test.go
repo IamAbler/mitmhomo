@@ -394,7 +394,7 @@ func TestBodyGlobalOwnerCapacityCannotBeBypassed(t *testing.T) {
 			broker.Close()
 		}
 	}()
-	for i := 0; i < 64; i++ {
+	for i := int64(0); i < defaultBodyExecutionCapacity; i++ {
 		ledger := testLedger(t, 0)
 		broker, err := NewBodyBroker(context.Background(), BodySource{Reader: io.NopCloser(&emptyBodyReader{}), Owner: FrameworkOwned, DeclaredLength: -1, Executions: NewBodyExecutionPool(1000)}, ledger)
 		if err != nil {
@@ -405,7 +405,7 @@ func TestBodyGlobalOwnerCapacityCannotBeBypassed(t *testing.T) {
 	if _, err := NewBodyBroker(context.Background(), BodySource{Reader: io.NopCloser(&emptyBodyReader{}), Owner: FrameworkOwned, DeclaredLength: -1, Executions: NewBodyExecutionPool(1000)}, testLedger(t, 0)); !errors.Is(err, ErrBodyCapacity) {
 		t.Fatal(err)
 	}
-	if defaultBodyExecutions.Occupied() != 64 {
+	if defaultBodyExecutions.Occupied() != defaultBodyExecutionCapacity {
 		t.Fatal("global cap bypassed")
 	}
 }

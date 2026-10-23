@@ -10,13 +10,15 @@ var (
 	ErrBodyBusy           = errors.New("body operation in progress")
 	ErrBodyCapacity       = errors.New("body execution ownership capacity exhausted")
 	bodyAlreadyDone       = func() <-chan struct{} { ch := make(chan struct{}); close(ch); return ch }()
-	defaultBodyExecutions = NewBodyExecutionPool(64)
+	defaultBodyExecutions = NewBodyExecutionPool(defaultBodyExecutionCapacity)
 )
+
+const defaultBodyExecutionCapacity int64 = 256
 
 // BodyExecutionPool bounds live source owners, including idle sources and
 // canceled I/O. It uses the existing Ledger reservation/release mechanism.
 // Reservation at source acceptance guarantees a drain slot even for Close.
-// A custom pool adds a restriction; it cannot bypass the default global 64.
+// A custom pool adds a restriction; it cannot bypass the default global cap.
 type BodyExecutionPool struct{ ledger *Ledger }
 
 func NewBodyExecutionPool(capacity int64) *BodyExecutionPool {
@@ -83,6 +85,10 @@ func (b *BodyBroker) ExecutionDone() <-chan struct{} {
 }
 
 func (b *BodyBroker) cancelOperation(op *bodyOperation, cause error) {
+	b.cancelOperationWithInterrupt(op, cause, true)
+}
+
+func (b *BodyBroker) cancelOperationWithInterrupt(op *bodyOperation, cause error, interruptRead bool) {
 	b.mu.Lock()
 	if b.operation != op || op.logicalClosed {
 		b.mu.Unlock()
@@ -99,7 +105,10 @@ func (b *BodyBroker) cancelOperation(op *bodyOperation, cause error) {
 	op.err = cause
 	op.logicalClosed = true
 	close(op.logical)
-	interrupt := b.interrupt
+	var interrupt func()
+	if interruptRead {
+		interrupt = b.interrupt
+	}
 	b.mu.Unlock()
 	// Only an explicitly certified, nonblocking adapter capability is called.
 	if interrupt != nil {
@@ -328,11 +337,12 @@ func (b *BodyBroker) CloseLogical() {
 	b.closing = true
 	if op := b.operation; op != nil {
 		drain := op.stream && !op.reading
+		interruptRead := !drain
 		if drain {
 			op.reading = true
 		}
 		b.mu.Unlock()
-		b.cancelOperation(op, ErrReleased)
+		b.cancelOperationWithInterrupt(op, ErrReleased, interruptRead)
 		if drain {
 			b.dispatchBodyClose(op)
 		}

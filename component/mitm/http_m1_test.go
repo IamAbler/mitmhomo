@@ -68,7 +68,7 @@ func makeTestUpstreamCertificate(t *testing.T) (tls.Certificate, *x509.CertPool)
 	return makeTestUpstreamCertificateFor(t, "localhost")
 }
 
-func makeTestUpstreamCertificateFor(t *testing.T, serverName string) (tls.Certificate, *x509.CertPool) {
+func makeTestUpstreamCertificateFor(t testing.TB, serverName string) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)

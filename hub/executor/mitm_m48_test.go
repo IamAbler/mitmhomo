@@ -79,24 +79,17 @@ mitm:
 		require.NoError(t, e)
 		if version == "old" {
 			cfg.MITM.ProcessorFactory = func() ([]pipeline.Entry, error) {
-				return []pipeline.Entry{{Class: pipeline.Script, Processor: async}}, nil
+				return []pipeline.Entry{{Class: pipeline.Script, Processor: async, Match: func(metadata pipeline.Metadata) bool {
+					return metadata.Request.URL.Path() == "/async"
+				}}}, nil
 			}
 			cfg.MITM.RequestHook = func(request *http.Request) error {
 				if request.URL.Path != "/async" {
 					return nil
 				}
-				runner, ok := mitm.ProcessingRunnerFromContext(request.Context())
+				_, ok := mitm.ProcessingRunnerFromContext(request.Context())
 				if !ok {
 					return fmt.Errorf("missing bound pipeline")
-				}
-				tx, e := m48Transaction(runner.GenerationID())
-				if e != nil {
-					return e
-				}
-				defer tx.Close()
-				_, e = runner.Run(request.Context(), tx, model.RequestPhase)
-				if e == nil {
-					return fmt.Errorf("expected canceled invocation")
 				}
 				return nil
 			}
@@ -337,29 +330,3 @@ func (p *m48AsyncProcessor) Close() error {
 	return p.l.Close()
 }
 func (p *m48AsyncProcessor) WaitClosed(ctx context.Context) error { return p.l.WaitClosed(ctx) }
-func m48Transaction(id model.GenerationID) (*model.Transaction, error) {
-	ledger, e := model.NewLedger(-1, nil)
-	if e != nil {
-		return nil, e
-	}
-	copy := model.NewCopyLease(ledger)
-	defer copy.Close()
-	u, e := model.ParseURL(copy, "https://localhost/async", model.MITMHTTPS)
-	if e != nil {
-		return nil, e
-	}
-	headers, e := model.NewHeaderBlock(copy, nil)
-	if e != nil {
-		return nil, e
-	}
-	trailers, e := model.NewTrailerView(model.TrailerUnavailable, model.HeaderBlock{}, model.HeaderBlock{})
-	if e != nil {
-		return nil, e
-	}
-	head := model.RequestHead{Method: "GET", URL: u, Authority: "localhost", Headers: headers, Trailers: trailers}
-	broker, e := model.NewBodyBroker(context.Background(), model.BodySource{Owner: model.FrameworkOwned}, ledger)
-	if e != nil {
-		return nil, e
-	}
-	return model.NewTransaction(context.Background(), model.TransactionOptions{ID: "real-config-async", Generation: id, Connection: model.ConnectionView{ID: "real-h2", StreamID: "async"}, OriginalIngress: head, Request: head, RequestBody: model.NewBodySlot(broker), Ledger: ledger})
-}

@@ -293,6 +293,28 @@ func (t *Transaction) State() TransactionState     { t.mu.Lock(); defer t.mu.Unl
 func (t *Transaction) Outcome() ExchangeOutcome    { t.mu.Lock(); defer t.mu.Unlock(); return t.outcome }
 func (t *Transaction) Ledger() *Ledger             { return t.ledger } // Owner-only accounting.
 
+// BodyInfo returns a detached resource-state summary for the selected phase.
+// The body owner is copied under the Transaction lock before inspecting the
+// broker, so protocol adapters never alias mutable BodyBroker state.
+func (t *Transaction) BodyInfo(phase Phase) BodyInfo {
+	if t == nil {
+		return BodyInfo{State: Unavailable}
+	}
+	t.mu.Lock()
+	var broker *BodyBroker
+	switch phase {
+	case RequestPhase:
+		broker = t.requestBody.broker
+	case ResponsePhase:
+		broker = t.responseBody.broker
+	}
+	t.mu.Unlock()
+	if broker == nil {
+		return BodyInfo{State: Unavailable}
+	}
+	return broker.Info()
+}
+
 func (t *Transaction) check(expected Revision) error {
 	if t.state != Active {
 		return ErrClosed

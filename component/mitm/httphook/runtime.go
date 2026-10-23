@@ -70,6 +70,41 @@ func (s *Snapshot) matchingRule(phase Phase, request *http.Request, headers http
 	return nil
 }
 
+// HasPhase reports whether the immutable Snapshot contains rules for phase.
+// Protocol adapters use it to avoid creating a processing entry for an
+// inactive phase.
+func (s *Snapshot) HasPhase(phase Phase) bool {
+	if s == nil {
+		return false
+	}
+	for i := range s.rules {
+		if s.rules[i].phase == phase {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxBodyBytes is the bounded legacy hook Body limit frozen by Compile.
+func (s *Snapshot) MaxBodyBytes() int64 {
+	if s == nil {
+		return 0
+	}
+	return int64(s.config.MaxBodyBytes)
+}
+
+// MatchesRequest performs the same first-match predicate check as ApplyRequest
+// without reading or retaining the Body.
+func (s *Snapshot) MatchesRequest(request *http.Request) bool {
+	return s != nil && s.matchingRule(RequestPhase, request, request.Header, 0) != nil
+}
+
+// MatchesResponse performs the same first-match predicate check as
+// ApplyResponse without reading or retaining the Body.
+func (s *Snapshot) MatchesResponse(request *http.Request, response *http.Response) bool {
+	return s != nil && response != nil && s.matchingRule(ResponsePhase, request, response.Header, response.StatusCode) != nil
+}
+
 func (s *Snapshot) execute(ctx context.Context, rule *compiledRule, input any) (any, error) {
 	runtime, err := s.getRuntime()
 	if err != nil {

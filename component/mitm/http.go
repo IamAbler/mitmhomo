@@ -22,10 +22,11 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/mitm/httphook"
 	"github.com/metacubex/mihomo/component/mitm/processing/generation"
+	"github.com/metacubex/mihomo/component/mitm/processing/model"
+	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
 	"github.com/metacubex/mihomo/component/mitm/rewrite"
 	"github.com/metacubex/mihomo/component/sniffer"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/log"
 	domainname "github.com/metacubex/sing/common/metadata"
 )
 
@@ -187,130 +188,147 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 		return errors.New("MITM origin port is missing")
 	}
 
+	connectionID := processingConnectionID()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = withInboundBodySource(w, r)
+		trackedWriter := &commitTrackingWriter{ResponseWriter: w}
 		stream, err := lease.Transaction()
 		if err != nil {
-			rejectRequest(w, r, http.StatusServiceUnavailable, "connection retired")
+			rejectRequest(trackedWriter, r, http.StatusServiceUnavailable, "connection retired")
 			return
 		}
 		defer stream.Close()
 		processing, err := snapshot.plan.Runner(stream)
 		if err != nil {
-			rejectRequest(w, r, http.StatusServiceUnavailable, "processing unavailable")
+			writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), processingContextKey{}, processing))
 		if !(r.ProtoMajor == 1 && r.ProtoMinor == 1 || r.ProtoMajor == 2 && tlsConn.ConnectionState().NegotiatedProtocol == "h2") {
-			rejectRequest(w, r, http.StatusHTTPVersionNotSupported, "HTTP/1.1 or negotiated HTTP/2 is required")
+			rejectRequest(trackedWriter, r, http.StatusHTTPVersionNotSupported, "HTTP/1.1 or negotiated HTTP/2 is required")
 			return
 		}
 		if r.Method == http.MethodConnect || hasUpgrade(r) {
-			rejectRequest(w, r, http.StatusNotImplemented, "CONNECT and protocol upgrades are unsupported")
+			rejectRequest(trackedWriter, r, http.StatusNotImplemented, "CONNECT and protocol upgrades are unsupported")
 			return
 		}
 		urlTarget, err := validateClientRequest(r, hello.ServerName, originPort)
 		if err != nil {
-			rejectRequest(w, r, http.StatusMisdirectedRequest, "request authority does not match the TLS origin")
+			rejectRequest(trackedWriter, r, http.StatusMisdirectedRequest, "request authority does not match the TLS origin")
 			return
 		}
 		timeoutCtx, stopTimeout := context.WithTimeout(r.Context(), requestTimeout)
 		requestCtx, cancel := context.WithCancelCause(timeoutCtx)
+		responseFraming := &responseHookFraming{}
+		requestCtx = context.WithValue(requestCtx, responseHookFramingKey{}, responseFraming)
+		cancelFromDiscard := func(cause error) {
+			cancel(cause)
+		}
 		defer stopTimeout()
 		defer cancel(context.Canceled)
 		initialURL := *urlTarget
-		request := r.Clone(requestCtx)
-		// Capture before a replacement starts discarding the original H1 body;
-		// EOF can also initialize the server's Trailer field for late trailers.
 		inboundTrailers := r.Trailer
+		request := r.Clone(requestCtx)
 		request.URL = urlTarget
 		request.RequestURI = ""
-		var discardedBody *requestBodyDiscard
+		ingress := request.Clone(requestCtx)
+		ingressTarget := initialURL
+		ingress.URL = &ingressTarget
 		requestBodyStillServerOwned := true
 		if snapshot.config.RequestHook != nil {
 			bodyBeforeInternalHook := request.Body
 			if err := snapshot.config.RequestHook(request); err != nil {
-				rejectRequest(w, r, http.StatusBadRequest, "request rejected")
+				rejectRequest(trackedWriter, r, http.StatusBadRequest, "request rejected")
 				return
 			}
 			requestBodyStillServerOwned = sameRequestBody(request.Body, bodyBeforeInternalHook)
 		}
-		if hooks := snapshot.config.ScriptHooks; hooks != nil {
-			applyRequestHook := hooks.ApplyRequest
-			if requestBodyStillServerOwned {
-				// net/http.Server closes the original request body after this
-				// handler returns, so the script stage must leave it open.
-				applyRequestHook = hooks.ApplyRequestWithExternalBodyOwner
-			}
-			hookResult, err := applyRequestHook(request.Context(), request)
-			if err != nil {
-				if request.Context().Err() != nil {
-					return
-				}
-				rejectRequest(w, r, http.StatusBadRequest, "request body could not be buffered for HTTP script hook")
-				return
-			}
-			if hookResult.Fallback != nil {
-				log.Warnln("MITM HTTP request script hook fallback: %s", hookResult.Fallback)
-			}
-			if hookResult.Applied {
-				if err := applyRequestScriptResult(request, hookResult); err != nil {
-					log.Warnln("MITM HTTP request script hook returned invalid output; forwarding original request: %s", err)
-				}
-			}
-		}
 		if request.URL == nil {
-			rejectRequest(w, r, http.StatusBadRequest, "invalid rewritten request target")
+			rejectRequest(trackedWriter, r, http.StatusBadRequest, "invalid request target")
 			return
 		}
-		if pipeline := snapshot.config.Rewrite; pipeline != nil && pipeline.HasRequestRules() {
-			result, err := pipeline.ApplyRequest(request.Context(), rewrite.RequestView{
-				Method:  request.Method,
-				URL:     *request.URL,
-				Headers: requestHeaders(request.Header, request.Host),
-			})
-			if err != nil {
-				if request.Context().Err() != nil {
-					return
-				}
-				rejectRequest(w, r, http.StatusInternalServerError, "request rewrite failed")
-				return
-			}
-			if result.Terminal != nil {
-				discardedBody, forceClose := startRequestBodyDiscard(w, r, cancel)
-				terminalWriter := w
-				if discardedBody != nil {
-					defer discardedBody.stop(w)
-					terminalWriter = &requestBodyDiscardResponseWriter{ResponseWriter: w, discard: discardedBody}
-				}
-				writeTerminalResponse(terminalWriter, r, result.Terminal, forceClose)
-				return
-			}
-			if err := applyRequestResult(request, result); err != nil {
-				rejectRequest(w, r, http.StatusBadRequest, "invalid rewritten request")
-				return
-			}
-			if result.Body != nil {
-				discardedBody, _ = startRequestBodyDiscard(w, r, cancel)
-				if discardedBody != nil {
-					defer discardedBody.stop(w)
-				}
-			}
-		}
-		urlAuthorityChanged := !strings.EqualFold(initialURL.Scheme, request.URL.Scheme) || !sameURLAuthority(initialURL.Host, request.URL.Host)
-		if err := normalizeRequestURL(request); err != nil {
-			rejectRequest(w, r, http.StatusBadRequest, "invalid rewritten request target")
-			return
-		}
-		if urlAuthorityChanged {
-			// The final HTTPS URL is authoritative for HTTP Host and upstream SNI.
-			// Host is not a configurable rewrite header because it is represented
-			// separately by net/http.Request.Host.
+		if !sameURLAuthority(initialURL.Host, request.URL.Host) {
 			request.Host = request.URL.Host
+		}
+		if err := normalizeRequestURL(request); err != nil {
+			rejectRequest(trackedWriter, r, http.StatusBadRequest, "invalid request target")
+			return
+		}
+		tx, err := newRequestTransaction(requestCtx, request, ingress, request.URL, &initialURL, requestBodyStillServerOwned, inboundTrailers, connectionID, processing, stream)
+		if err != nil {
+			writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
+			return
+		}
+		defer func() { _ = tx.CloseContext(context.Background()) }()
+		requestReport, err := processing.Run(requestCtx, tx, model.RequestPhase)
+		if err != nil {
+			writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
+			return
+		}
+		switch requestReport.Outcome {
+		case pipeline.Rejected:
+			discardedBody, _ := startRequestBodyDiscard(trackedWriter, r, cancelFromDiscard)
+			if discardedBody != nil {
+				defer discardedBody.stop(trackedWriter)
+			}
+			rejectWriter := http.ResponseWriter(trackedWriter)
+			if discardedBody != nil {
+				rejectWriter = &requestBodyDiscardResponseWriter{ResponseWriter: trackedWriter, discard: discardedBody}
+			}
+			writeRejected(rejectWriter)
+			return
+		case pipeline.Aborted:
+			tx.Terminate(errProcessingAborted)
+			panic(http.ErrAbortHandler)
+		case pipeline.SyntheticReady:
+			discardedBody, _ := startRequestBodyDiscard(trackedWriter, r, cancelFromDiscard)
+			if discardedBody != nil {
+				defer discardedBody.stop(trackedWriter)
+			}
+			syntheticWriter := http.ResponseWriter(trackedWriter)
+			if discardedBody != nil {
+				syntheticWriter = &requestBodyDiscardResponseWriter{ResponseWriter: trackedWriter, discard: discardedBody}
+			}
+			synthetic, ok := tx.TakeSynthetic()
+			if !ok {
+				writeProcessingFailure(trackedWriter, r, model.ErrInvalid, model.RequestPhase)
+				return
+			}
+			defer synthetic.Release()
+			if err := writeSyntheticResponse(syntheticWriter, r, synthetic); err != nil {
+				if trackedWriter.Committed() {
+					panic(http.ErrAbortHandler)
+				}
+				writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
+			}
+			return
+		case pipeline.ContinueUpstream:
+		default:
+			writeProcessingFailure(trackedWriter, r, errors.New("unexpected request processing outcome"), model.RequestPhase)
+			return
+		}
+		bodyInfo, err := applyRequestTransaction(request, tx)
+		if err != nil {
+			writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
+			return
+		}
+		if err := normalizeRequestURL(request); err != nil {
+			writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
+			return
+		}
+		if !sameURLAuthority(initialURL.Host, request.URL.Host) {
+			request.Host = request.URL.Host
+		}
+		var discardedBody *requestBodyDiscard
+		if bodyInfo.NeedsServerDisposal || !requestBodyStillServerOwned {
+			discardedBody, _ = startRequestBodyDiscard(trackedWriter, r, cancelFromDiscard)
+			if discardedBody != nil {
+				defer discardedBody.stop(trackedWriter)
+			}
 		}
 		targetMetadata, err := metadataForURL(metadata, request.URL, originHost)
 		if err != nil {
-			rejectRequest(w, r, http.StatusBadRequest, "invalid upstream target")
+			writeProcessingFailure(trackedWriter, r, err, model.RequestPhase)
 			return
 		}
 		proxy := &httputil.ReverseProxy{
@@ -326,50 +344,42 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 			},
 			Rewrite: func(*httputil.ProxyRequest) {},
 			ModifyResponse: func(response *http.Response) error {
-				forceResponseAdapter := snapshot.config.ResponseHook != nil
-				if snapshot.config.ResponseHook != nil {
-					if err := snapshot.config.ResponseHook(response); err != nil {
+				if err := enterUpstreamResponse(tx, response, stream); err != nil {
+					return err
+				}
+				responseReport, err := processing.Run(requestCtx, tx, model.ResponsePhase)
+				if err != nil {
+					return err
+				}
+				switch responseReport.Outcome {
+				case pipeline.ResponseComplete:
+					if err := responseFraming.validate(tx); err != nil {
 						return err
 					}
+					return applyResponseTransaction(response, tx, r.Method)
+				case pipeline.Rejected:
+					return errProcessingRejected
+				case pipeline.Aborted:
+					return errProcessingAborted
+				default:
+					return fmt.Errorf("unexpected response processing outcome %d", responseReport.Outcome)
 				}
-				if hooks := snapshot.config.ScriptHooks; hooks != nil {
-					hookResult, err := hooks.ApplyResponse(request.Context(), request, response)
-					if err != nil {
-						return fmt.Errorf("buffer response for HTTP script hook: %w", err)
-					}
-					if hookResult.Fallback != nil {
-						log.Warnln("MITM HTTP response script hook fallback: %s", hookResult.Fallback)
-					}
-					if hookResult.Applied {
-						if err := applyResponseScriptResult(response, hookResult, r.Method); err != nil {
-							log.Warnln("MITM HTTP response script hook returned invalid output; forwarding original response: %s", err)
-						} else {
-							forceResponseAdapter = true
-						}
-					}
-				}
-				err := applyResponseRewrite(request.Context(), rewrite.RequestView{
-					Method:  request.Method,
-					URL:     *request.URL,
-					Headers: requestHeaders(request.Header, request.Host),
-				}, response, snapshot.config.Rewrite, forceResponseAdapter, r.Method)
-				if err == nil && r.ProtoMajor == 2 && response.StatusCode == http.StatusNotModified {
-					// A 304 has no DATA. Omit optional representation length for
-					// clients that interpret it as a promised stream length.
-					response.Header.Del("Content-Length")
-					response.ContentLength = -1
-				}
-				return err
 			},
-			ErrorHandler: func(w http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
+			ErrorHandler: func(errorWriter http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
+				if trackedWriter.Committed() {
+					panic(http.ErrAbortHandler)
+				}
+				if errors.Is(roundTripErr, errProcessingAborted) {
+					panic(http.ErrAbortHandler)
+				}
+				if errors.Is(roundTripErr, errProcessingRejected) {
+					http.Error(errorWriter, "response rejected", http.StatusForbidden)
+					return
+				}
 				requestErr := proxyRequest.Context().Err()
 				requestCause := context.Cause(proxyRequest.Context())
 				requestTimedOut := errors.Is(roundTripErr, context.DeadlineExceeded) || errors.Is(requestErr, context.DeadlineExceeded) || errors.Is(requestCause, context.DeadlineExceeded)
 				if errors.Is(requestErr, context.Canceled) && !requestTimedOut && discardedBody != nil {
-					// The HTTP server can cancel the request Context as soon as a
-					// timed-out Body.Read fails. Wait for that reader's result before
-					// classifying the cancellation, so a body read timeout is not
-					// mistaken for a disconnected client and turned into an empty 200.
 					requestTimedOut = isTimeoutError(discardedBody.resultAfterDone().err)
 				}
 				if errors.Is(requestErr, context.Canceled) && !requestTimedOut {
@@ -378,13 +388,27 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 				status := http.StatusBadGateway
 				if requestTimedOut {
 					status = http.StatusGatewayTimeout
+				} else {
+					var processingErr *model.ProcessingError
+					if errors.As(roundTripErr, &processingErr) {
+						status = processingFailureStatus(roundTripErr, model.ResponsePhase)
+					}
 				}
-				http.Error(w, "upstream request failed", status)
+				if status == 0 {
+					return
+				}
+				message := "upstream request failed"
+				if status == http.StatusGatewayTimeout {
+					message = "upstream request timed out"
+				} else if status == http.StatusServiceUnavailable {
+					message = "HTTP processing capacity is unavailable"
+				}
+				http.Error(errorWriter, message, status)
 			},
 		}
-		proxyWriter := w
+		proxyWriter := http.ResponseWriter(trackedWriter)
 		if discardedBody != nil {
-			proxyWriter = &requestBodyDiscardResponseWriter{ResponseWriter: w, discard: discardedBody}
+			proxyWriter = &requestBodyDiscardResponseWriter{ResponseWriter: trackedWriter, discard: discardedBody}
 		}
 		proxy.ServeHTTP(proxyWriter, request)
 	})
@@ -697,14 +721,9 @@ func startRequestBodyDiscard(w http.ResponseWriter, request *http.Request, cance
 		// the upstream does not need. Close this HTTP/1 connection after reply.
 		request.Close = true
 		w.Header().Set("Connection", "close")
-		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
 		return nil, true
 	}
 	reusable := request.ContentLength > 0 && request.ContentLength <= maxReusableDiscardBytes && request.Header.Get("Expect") == ""
-	if !reusable {
-		request.Close = true
-		w.Header().Set("Connection", "close")
-	}
 	limit := int64(maxReusableDiscardBytes + 1)
 	if reusable {
 		// Read one byte beyond the declared size so the server Body observes EOF
@@ -769,15 +788,24 @@ func (discard *requestBodyDiscard) beforeResponseWrite(w http.ResponseWriter) {
 	discard.responseStarted = true
 	select {
 	case <-discard.done:
-		if discard.reusable && discard.result.complete && (discard.result.err == nil || errors.Is(discard.result.err, io.EOF)) {
+		if discard.result.complete && (discard.result.err == nil || errors.Is(discard.result.err, io.EOF)) {
+			if !discard.reusable {
+				discard.request.Close = true
+				w.Header().Set("Connection", "close")
+			}
 			discard.mu.Unlock()
 			return
 		}
 	default:
 	}
 	discard.mu.Unlock()
-	discard.forceClose(w)
-	<-discard.done
+	// Mark the HTTP/1 connection for closure before response headers are
+	// written, but leave the request Body reader alone while ReverseProxy may
+	// still be streaming the upstream response. stop() applies the read deadline
+	// after ServeHTTP returns, so an incomplete upload cannot cancel a valid
+	// response body through net/http's request Context.
+	discard.request.Close = true
+	w.Header().Set("Connection", "close")
 }
 
 func (discard *requestBodyDiscard) stop(w http.ResponseWriter) {

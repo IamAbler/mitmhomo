@@ -88,7 +88,11 @@ func (rt *nativeRoundTripper) roundTripProtocol(req *http.Request) (*http.Respon
 	// This context is the exact request context, never Transport's detached dial
 	// context. It remains armed throughout streaming of the response body.
 	var once sync.Once
-	closeConn := func() { once.Do(func() { _ = conn.Close() }) }
+	closeConn := func() {
+		once.Do(func() {
+			_ = conn.Close()
+		})
+	}
 	stop := closeOnContextDone(req.Context(), closeConn)
 	var finishOnce sync.Once
 	finish := func() { finishOnce.Do(func() { closeConn(); stop() }) }

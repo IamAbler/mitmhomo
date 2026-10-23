@@ -903,8 +903,12 @@ func TestM2ClientCancellationClosesRewrittenUpstreamConnection(t *testing.T) {
 		upstreamConns <- conn
 		started <- struct{}{}
 		var one [1]byte
-		if _, err := conn.Read(one[:]); err != nil {
-			canceled <- struct{}{}
+		for {
+			_, err := conn.Read(one[:])
+			if err != nil {
+				canceled <- struct{}{}
+				return
+			}
 		}
 	})
 	t.Cleanup(func() {

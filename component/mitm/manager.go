@@ -148,6 +148,7 @@ func (m *Manager) updateContext(ctx context.Context, config Config, prepare bool
 	}
 	snapshot := &configSnapshot{
 		config: Config{
+			ProcessorFactory:   config.ProcessorFactory,
 			Enabled:            config.Enabled,
 			Ports:              append([]uint16(nil), config.Ports...),
 			PortRanges:         append([]PortRange(nil), config.PortRanges...),
@@ -194,6 +195,27 @@ func (m *Manager) updateContext(ctx context.Context, config Config, prepare bool
 		if err != nil {
 			return failCandidate(ctx, generation.FailedBuild(err, entries, snapshot.config.ScriptHooks), reservation)
 		}
+	}
+	if config.Enabled {
+		internal, err := internalResponseHookEntry(snapshot.config.ResponseHook)
+		if err != nil {
+			return failCandidate(ctx, generation.FailedBuild(err, entries, snapshot.config.ScriptHooks), reservation)
+		}
+		if internal.Processor != nil {
+			entries = append(entries, internal)
+		}
+		legacy, err := legacyHookEntry(snapshot.config.ScriptHooks)
+		if err != nil {
+			return failCandidate(ctx, generation.FailedBuild(err, entries, snapshot.config.ScriptHooks), reservation)
+		}
+		if legacy.Processor != nil {
+			entries = append(entries, legacy)
+		}
+		rewrites, err := rewriteEntries(snapshot.config.Rewrite)
+		if err != nil {
+			return failCandidate(ctx, generation.FailedBuild(err, entries, snapshot.config.ScriptHooks), reservation)
+		}
+		entries = append(entries, rewrites...)
 	}
 	plan, err := generation.NewPlan(entries, snapshot.config.ScriptHooks)
 	if err != nil {
@@ -307,6 +329,7 @@ func (m *Manager) ConfigSnapshot() Config {
 		return Config{}
 	}
 	return Config{
+		ProcessorFactory:   snapshot.config.ProcessorFactory,
 		Enabled:            snapshot.config.Enabled,
 		Ports:              append([]uint16(nil), snapshot.config.Ports...),
 		PortRanges:         append([]PortRange(nil), snapshot.config.PortRanges...),
