@@ -21,6 +21,13 @@ const (
 	ProcessingErrorProtocol
 	ProcessingErrorUpstream
 	ProcessingErrorEgress
+	ProcessingErrorInvalidConfiguration
+	ProcessingErrorBodyLimitExceeded
+	ProcessingErrorOutputLimitExceeded
+	ProcessingErrorCapacityExhausted
+	ProcessingErrorCleanupFailure
+	ProcessingErrorGenerationRetired
+	ProcessingErrorIrreversibleIOFailure
 )
 
 // ProcessingErrorOrigin identifies the component that introduced a failure.
@@ -36,18 +43,25 @@ const (
 )
 
 var processingErrorSentinels = map[ProcessingErrorKind]error{
-	ProcessingErrorInvalidInput:  errors.New("processing invalid input"),
-	ProcessingErrorCompile:       errors.New("processing compile failure"),
-	ProcessingErrorExecution:     errors.New("processing execution failure"),
-	ProcessingErrorInvalidOutput: errors.New("processing invalid output"),
-	ProcessingErrorResourceLimit: errors.New("processing resource limit"),
-	ProcessingErrorTimeout:       errors.New("processing timeout"),
-	ProcessingErrorCanceled:      errors.New("processing canceled"),
-	ProcessingErrorClosed:        errors.New("processing closed"),
-	ProcessingErrorBodyRead:      errors.New("processing body read failure"),
-	ProcessingErrorProtocol:      errors.New("processing protocol failure"),
-	ProcessingErrorUpstream:      errors.New("processing upstream failure"),
-	ProcessingErrorEgress:        errors.New("processing egress failure"),
+	ProcessingErrorInvalidInput:          errors.New("processing invalid input"),
+	ProcessingErrorCompile:               errors.New("processing compile failure"),
+	ProcessingErrorExecution:             errors.New("processing execution failure"),
+	ProcessingErrorInvalidOutput:         errors.New("processing invalid output"),
+	ProcessingErrorResourceLimit:         errors.New("processing resource limit"),
+	ProcessingErrorTimeout:               errors.New("processing timeout"),
+	ProcessingErrorCanceled:              errors.New("processing canceled"),
+	ProcessingErrorClosed:                errors.New("processing closed"),
+	ProcessingErrorBodyRead:              errors.New("processing body read failure"),
+	ProcessingErrorProtocol:              errors.New("processing protocol failure"),
+	ProcessingErrorUpstream:              errors.New("processing upstream failure"),
+	ProcessingErrorEgress:                errors.New("processing egress failure"),
+	ProcessingErrorInvalidConfiguration:  errors.New("processing invalid configuration"),
+	ProcessingErrorBodyLimitExceeded:     errors.New("processing body limit exceeded"),
+	ProcessingErrorOutputLimitExceeded:   errors.New("processing output limit exceeded"),
+	ProcessingErrorCapacityExhausted:     errors.New("processing capacity exhausted"),
+	ProcessingErrorCleanupFailure:        errors.New("processing cleanup failure"),
+	ProcessingErrorGenerationRetired:     errors.New("processing generation retired"),
+	ProcessingErrorIrreversibleIOFailure: errors.New("processing irreversible I/O failure"),
 }
 
 // ErrorSentinel returns the errors.Is sentinel associated with kind.

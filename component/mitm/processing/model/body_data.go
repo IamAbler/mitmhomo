@@ -55,7 +55,9 @@ func (b *bodyData) disposeSource() error {
 		// upload. This broker may neither drain nor close it behind its back.
 		b.serverDisposal = !b.eof
 	} else {
-		b.closeErr = errors.Join(b.closeErr, source.Close())
+		if err := source.Close(); err != nil {
+			b.closeErr = errors.Join(b.closeErr, errors.Join(ErrCleanupFailure, err))
+		}
 	}
 	return b.closeErr
 }

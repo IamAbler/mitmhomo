@@ -23,10 +23,14 @@ func testHead(t testing.TB, lease *CopyLease, method, target string) RequestHead
 	return RequestHead{Method: method, URL: u, Authority: "host-override.example", Headers: h}
 }
 func testTransaction(t testing.TB, ctx context.Context, l *Ledger, source BodySlot) (*Transaction, *CopyLease) {
+	return testTransactionWithPolicy(t, ctx, l, source, nil)
+}
+
+func testTransactionWithPolicy(t testing.TB, ctx context.Context, l *Ledger, source BodySlot, policy *TimeoutPolicy) (*Transaction, *CopyLease) {
 	t.Helper()
 	lease := NewCopyLease(l)
 	head := testHead(t, lease, "POST", "https://example.test/a%2Fb?b=2&a=&b=1")
-	tx, err := NewTransaction(ctx, TransactionOptions{ID: "tx-1", Generation: 7, Connection: ConnectionView{ID: "conn-1", StreamID: "stream-1", Downstream: ProtocolInfo{Major: 2, Known: true}}, OriginalIngress: head, Request: head, RequestBody: source, Ledger: l})
+	tx, err := NewTransaction(ctx, TransactionOptions{ID: "tx-1", Generation: 7, Connection: ConnectionView{ID: "conn-1", StreamID: "stream-1", Downstream: ProtocolInfo{Major: 2, Known: true}}, OriginalIngress: head, Request: head, RequestBody: source, Ledger: l, Timeouts: policy})
 	if err != nil {
 		lease.Close()
 		t.Fatal(err)
@@ -158,6 +162,43 @@ func TestTransactionResponseEntryAndFailureRollback(t *testing.T) {
 	}
 }
 
+func TestResponseBodyUsesTransactionBudget(t *testing.T) {
+	transactionLedger := testLedger(t, -1)
+	tx, sourceLease := testTransaction(t, context.Background(), transactionLedger, BodySlot{})
+	sourceLease.Close()
+	responseLedger := testLedger(t, -1)
+	body, _ := testBody(t, context.Background(), strings.NewReader("response"), TransportOwned, 8, responseLedger)
+	if err := tx.EnterResponse(tx.Revision(), ResponseHead{Status: 200}, ResponseHead{Status: 200}, NewBodySlot(body), OriginUpstream); err != nil {
+		t.Fatal(err)
+	}
+	beforeTransaction := tx.Ledger().Current()
+	beforeResponse := responseLedger.Current()
+	if err := tx.PrepareBody(FullBuffered, 8); err != nil {
+		t.Fatal(err)
+	}
+	if tx.Ledger().Current() < beforeTransaction+8 {
+		t.Fatal("response body bytes escaped the Transaction ledger")
+	}
+	if responseLedger.Current() != beforeResponse {
+		t.Fatal("response body kept charging its detached construction ledger")
+	}
+}
+
+func TestTransactionBodyReplacementRespectsDefaultBufferCap(t *testing.T) {
+	ledger := testLedger(t, -1)
+	body, source := testBody(t, context.Background(), strings.NewReader("source"), TransportOwned, -1, ledger)
+	tx, metadata := testTransaction(t, context.Background(), ledger, NewBodySlot(body))
+	metadata.Close()
+	before := tx.Revision()
+	replacement := make([]byte, DefaultBodyBufferBytes+1)
+	if err := tx.ReplaceBody(before, replacement); !errors.Is(err, ErrBodyLimit) {
+		t.Fatalf("oversized body replacement was accepted: %v", err)
+	}
+	if tx.Revision() != before || source.reads.Load() != 0 || body.Info().State != UnreadStream {
+		t.Fatal("rejected body replacement mutated the Transaction or consumed its source")
+	}
+}
+
 func TestTransactionDeadlineTerminateAndClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -182,6 +223,65 @@ func TestTransactionDeadlineTerminateAndClose(t *testing.T) {
 	if tx.State() != Closed || !errors.Is(tx.CancellationCause(), cause) || l.Current() != 0 {
 		t.Fatal("close not terminal/idempotent")
 	}
+}
+
+func TestTransactionTimeoutInheritsParentAndEnforcesItsOwnDeadline(t *testing.T) {
+	parent, cancelParent := context.WithCancelCause(context.Background())
+	policy := DefaultTimeoutPolicy()
+	policy.Transaction = time.Second
+	ledger := testLedger(t, -1)
+	tx, sourceLease := testTransactionWithTimeout(t, parent, ledger, policy)
+	sourceLease.Close()
+	cancelParent(context.Canceled)
+	select {
+	case <-tx.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("parent cancellation did not propagate")
+	}
+	if !errors.Is(tx.CancellationCause(), context.Canceled) {
+		t.Fatalf("parent cause was lost: %v", tx.CancellationCause())
+	}
+	tx.Close()
+
+	deadlineParent, cancelDeadlineParent := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	policy.Transaction = time.Second
+	txParentDeadline, sourceLeaseParent := testTransactionWithTimeout(t, deadlineParent, testLedger(t, -1), policy)
+	sourceLeaseParent.Close()
+	parentDeadline, _ := deadlineParent.Deadline()
+	if got, ok := txParentDeadline.Deadline(); !ok || got.After(parentDeadline) {
+		t.Fatal("transaction deadline exceeded its parent")
+	}
+	cancelDeadlineParent()
+	txParentDeadline.Close()
+
+	policy = DefaultTimeoutPolicy()
+	policy.Transaction = 30 * time.Millisecond
+	tx2, sourceLease2 := testTransactionWithTimeout(t, context.Background(), testLedger(t, -1), policy)
+	defer sourceLease2.Close()
+	select {
+	case <-tx2.Context().Done():
+		if !errors.Is(tx2.CancellationCause(), context.DeadlineExceeded) {
+			t.Fatalf("transaction timeout cause was lost: %v", tx2.CancellationCause())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transaction total timeout was not enforced")
+	}
+	tx2.Close()
+}
+
+func testTransactionWithTimeout(t testing.TB, ctx context.Context, ledger *Ledger, policy TimeoutPolicy) (*Transaction, *CopyLease) {
+	t.Helper()
+	lease := NewCopyLease(ledger)
+	head := testHead(t, lease, "POST", "https://example.test/timeout")
+	tx, err := NewTransaction(ctx, TransactionOptions{
+		ID: "tx-timeout", Generation: 9, Connection: ConnectionView{ID: "conn-timeout"},
+		OriginalIngress: head, Request: head, Ledger: ledger, Timeouts: &policy,
+	})
+	if err != nil {
+		lease.Close()
+		t.Fatal(err)
+	}
+	return tx, lease
 }
 
 func TestConcurrentTransactionSnapshotAndClose(t *testing.T) {

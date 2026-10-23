@@ -70,6 +70,7 @@ type ExecutionResources func(context.Context, processor.Descriptor, model.Invoca
 type Options struct {
 	AcquireGeneration GenerationLease
 	AcquireExecution  ExecutionResources
+	InvocationPool    *processor.InvocationPool
 }
 
 type Runner struct {
@@ -114,8 +115,11 @@ func NewRunner(entries []Entry, options Options) (*Runner, error) {
 		// Legacy fallback is enabled only when the integration supplies a
 		// per-entry guard that can reject fallback after irreversible I/O.
 		if entry.Processor == nil || entry.Class < InternalHook || entry.Class > Rewrite || entry.Profile > LegacyProfile || entry.Profile == LegacyProfile && entry.FailOpenSafe == nil {
-			return nil, model.ErrInvalid
+			return nil, model.NewProcessingError(model.ProcessingErrorInvalidConfiguration, model.ProcessingOriginProcessor, model.PhaseInvalid, "", "", model.ErrInvalid)
 		}
+	}
+	if options.InvocationPool == nil {
+		options.InvocationPool = processor.DefaultInvocationPool()
 	}
 	sort.SliceStable(copyEntries, func(i, j int) bool {
 		if copyEntries[i].Class != copyEntries[j].Class {
@@ -138,12 +142,15 @@ func (r *Runner) Run(ctx context.Context, tx *model.Transaction, phase model.Pha
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	phaseTimeout, phaseScope := tx.Timeouts().Phase(phase)
+	phaseCtx, cancelPhase := model.WithTimeoutScope(ctx, phaseTimeout, phaseScope)
+	defer cancelPhase()
 	if phase == model.ResponsePhase && tx.Outcome() == model.ExchangeSynthetic {
 		report.Outcome = SkippedSyntheticResponse
 		report.Revision = tx.Revision()
 		return report, nil
 	}
-	permit, skipped, err := tx.AcquirePipelinePhase(ctx, phase)
+	permit, skipped, err := tx.AcquirePipelinePhase(phaseCtx, phase)
 	if err != nil {
 		failure := classify(err, phase, "", "", model.ProcessingOriginRequest)
 		if kind := processingKind(failure); kind == model.ProcessingErrorCanceled || kind == model.ProcessingErrorTimeout {
@@ -159,7 +166,7 @@ func (r *Runner) Run(ctx context.Context, tx *model.Transaction, phase model.Pha
 	defer permit.Release()
 	// Observe cancellation and an existing BodyBroker fault without consuming
 	// the real source. FullBuffered still waits until after metadata selection.
-	if err := tx.PrepareBodyContext(ctx, model.None, 0); err != nil {
+	if err := tx.PrepareBodyContext(phaseCtx, model.None, 0); err != nil {
 		return r.terminate(tx, report, classifyBody(err, phase, "", ""))
 	}
 
@@ -190,7 +197,7 @@ func (r *Runner) Run(ctx context.Context, tx *model.Transaction, phase model.Pha
 				matchedScript = true
 			}
 
-			result, input, inputLease, started, executionDone, err := r.invoke(ctx, tx, entry, descriptor, input, inputLease)
+			result, input, inputLease, started, executionDone, err := r.invoke(phaseCtx, tx, entry, descriptor, input, inputLease)
 			if err != nil {
 				if inputLease != nil {
 					_ = inputLease.Close()
@@ -223,9 +230,13 @@ func (r *Runner) Run(ctx context.Context, tx *model.Transaction, phase model.Pha
 				return r.terminate(tx, report, failure)
 			}
 			kind := result.Kind()
-			if _, err := tx.Commit(input, result); err != nil {
+			if _, err := tx.CommitContext(phaseCtx, input, result); err != nil {
 				_ = result.Release()
-				failure := classify(err, phase, descriptor.ID, input.Key().Invocation, model.ProcessingOriginProtocol)
+				origin := model.ProcessingOriginProtocol
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					origin = model.ProcessingOriginRequest
+				}
+				failure := classify(err, phase, descriptor.ID, input.Key().Invocation, origin)
 				// A stale/foreign key is not a recoverable Processor entry error.
 				return r.terminate(tx, report, failure)
 			}
@@ -294,9 +305,22 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	if key.Phase == model.ResponsePhase {
 		requirements = descriptor.ResponseNeeds
 	}
+	invocationCtx, cancelInvocation := model.WithTimeoutScope(ctx, requirements.TotalTimeout, model.TimeoutScopeProcessor)
+	defer cancelInvocation()
+	invocationPermit, err := r.options.InvocationPool.Acquire(invocationCtx)
+	if err != nil {
+		_ = inputLease.Close()
+		return model.DoneResult{}, input, nil, false, true, classify(err, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
+	}
+	permitOwned := true
+	defer func() {
+		if permitOwned {
+			_ = invocationPermit.Close()
+		}
+	}()
 	var bodyResources []io.Closer
 	if requirements.Body == model.FullBuffered && r.options.AcquireGeneration != nil {
-		pin, err := r.options.AcquireGeneration(ctx, key.Generation)
+		pin, err := r.options.AcquireGeneration(invocationCtx, key.Generation)
 		if err != nil {
 			_ = inputLease.Close()
 			return model.DoneResult{}, input, nil, false, true, classify(err, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginConnection)
@@ -307,9 +331,11 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		}
 		bodyResources = append(bodyResources, pin)
 	}
-	if err := tx.PrepareBodyContext(ctx, requirements.Body, requirements.MaxBodyBytes, bodyResources...); err != nil {
+	bodyLimit := tx.Limits().BodyLimit(requirements.MaxBodyBytes)
+	prepareErr := tx.PrepareBodyContext(invocationCtx, requirements.Body, bodyLimit, bodyResources...)
+	if prepareErr != nil {
 		_ = inputLease.Close()
-		return model.DoneResult{}, input, nil, false, channelClosed(tx.BodyExecutionDone()), classifyBody(err, key.Phase, descriptor.ID, key.Invocation)
+		return model.DoneResult{}, input, nil, false, channelClosed(tx.BodyExecutionDone()), classifyBody(prepareErr, key.Phase, descriptor.ID, key.Invocation)
 	}
 	if requirements.Body == model.FullBuffered {
 		_ = inputLease.Close()
@@ -320,16 +346,16 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		}
 		key = input.Key()
 	}
-	if ctx.Err() != nil || tx.Context().Err() != nil {
+	if invocationCtx.Err() != nil || tx.Context().Err() != nil {
 		_ = inputLease.Close()
-		cause := context.Cause(ctx)
+		cause := context.Cause(invocationCtx)
 		if tx.Context().Err() != nil {
 			cause = tx.CancellationCause()
 		}
 		return model.DoneResult{}, input, nil, false, true, classify(cause, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginRequest)
 	}
 
-	resources := []io.Closer{&onceCloser{inner: inputLease}}
+	resources := []io.Closer{&onceCloser{inner: inputLease}, invocationPermit}
 	prepareResource := func(resource io.Closer) {
 		if resource != nil {
 			if _, ok := resource.(processor.ExecutionFinalizer); ok {
@@ -340,7 +366,7 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		}
 	}
 	if r.options.AcquireGeneration != nil {
-		generation, err := r.options.AcquireGeneration(ctx, key.Generation)
+		generation, err := r.options.AcquireGeneration(invocationCtx, key.Generation)
 		if err != nil {
 			cleanupErr := closeResources(resources)
 			return model.DoneResult{}, input, nil, false, cleanupErr == nil, classify(joinCleanup(err, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginConnection)
@@ -353,7 +379,7 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		prepareResource(generation)
 	}
 	if r.options.AcquireExecution != nil {
-		extra, err := r.options.AcquireExecution(ctx, descriptor, key)
+		extra, err := r.options.AcquireExecution(invocationCtx, descriptor, key)
 		for _, resource := range extra {
 			prepareResource(resource)
 		}
@@ -362,9 +388,9 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 			return model.DoneResult{}, input, nil, false, cleanupErr == nil, classify(joinCleanup(err, cleanupErr), key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginProcessor)
 		}
 	}
-	if ctx.Err() != nil || tx.Context().Err() != nil {
+	if invocationCtx.Err() != nil || tx.Context().Err() != nil {
 		cleanupErr := closeResources(resources)
-		cause := context.Cause(ctx)
+		cause := context.Cause(invocationCtx)
 		if tx.Context().Err() != nil {
 			cause = tx.CancellationCause()
 		}
@@ -377,7 +403,20 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 	for i := range resources {
 		closers[len(resources)-1-i] = resources[i]
 	}
-	invocation, startErr := entry.Processor.Start(tx.Context(), input, closers...)
+	startParent := tx.Context()
+	if deadline, ok := invocationCtx.Deadline(); ok {
+		if invocationCtx.Err() != nil {
+			cleanupErr := closeResources(resources)
+			origin := model.TimeoutScopeOrigin(model.TimeoutScopeOf(invocationCtx))
+			return model.DoneResult{}, input, nil, false, cleanupErr == nil, classify(joinCleanup(context.DeadlineExceeded, cleanupErr), key.Phase, descriptor.ID, key.Invocation, origin)
+		}
+		var cancelStart context.CancelFunc
+		startParent, cancelStart = model.WithDeadlineScope(startParent, deadline, model.TimeoutScopeOf(invocationCtx))
+		defer cancelStart()
+	}
+	startCtx, cancelExecution := model.WithTimeoutScope(startParent, requirements.ExecutionTimeout, model.TimeoutScopeProcessor)
+	defer cancelExecution()
+	invocation, startErr := entry.Processor.Start(startCtx, input, closers...)
 	if startErr != nil {
 		cleanupErr := closeResources(resources)
 		if invocation != nil {
@@ -389,6 +428,7 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		cleanupErr := closeResources(resources)
 		return model.DoneResult{}, input, nil, true, cleanupErr == nil, model.NewProcessingError(model.ProcessingErrorExecution, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, joinCleanup(model.ErrInvalid, cleanupErr))
 	}
+	permitOwned = false // Invocation owns capacity until real ExecutionDone.
 	if invocation.Key() != key {
 		invocation.Cancel(model.ErrInvalid)
 		// Cancel synchronously fixes LogicalDone even while Finish is blocked
@@ -401,13 +441,7 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		return model.DoneResult{}, input, nil, true, executionDone, model.NewProcessingError(model.ProcessingErrorInvalidOutput, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, cause)
 	}
 
-	awaitCtx := ctx
-	cancel := func() {}
-	if requirements.TotalTimeout > 0 {
-		awaitCtx, cancel = context.WithTimeout(ctx, requirements.TotalTimeout)
-	}
-	result, awaitErr := invocation.Await(awaitCtx)
-	cancel()
+	result, awaitErr := invocation.Await(invocationCtx)
 	if awaitErr != nil {
 		_ = result.Release()
 		cleanupErr := invocation.CleanupError()
@@ -421,15 +455,21 @@ func (r *Runner) invoke(ctx context.Context, tx *model.Transaction, entry Entry,
 		}
 		return model.DoneResult{}, input, nil, true, channelClosed(invocation.ExecutionDone()), classify(cause, key.Phase, descriptor.ID, key.Invocation, model.ProcessingOriginRequest)
 	}
+	outputLimit := tx.Limits().OutputLimit(requirements.MaxOutputBytes)
+	if result.AllocatedBytes() > outputLimit {
+		_ = result.Release()
+		failure := model.NewProcessingError(model.ProcessingErrorOutputLimitExceeded, model.ProcessingOriginProcessor, key.Phase, descriptor.ID, key.Invocation, model.ErrOutputLimit)
+		return model.DoneResult{}, input, nil, true, channelClosed(invocation.ExecutionDone()), failure
+	}
 	return result, input, nil, true, channelClosed(invocation.ExecutionDone()), nil
 }
 
 func (r *Runner) canFailOpen(entry Entry, err error, started, executionDone bool) bool {
-	if (!entry.AllowFailOpen && entry.Profile != LegacyProfile) || !executionDone || errors.Is(err, errExecutionResourceCleanup) {
+	if (!entry.AllowFailOpen && entry.Profile != LegacyProfile) || !executionDone || errors.Is(err, errExecutionResourceCleanup) || errors.Is(err, model.ErrCleanupFailure) || errors.Is(err, model.ErrIrreversibleIO) || errors.Is(err, model.ErrGenerationRetired) {
 		return false
 	}
 	kind := processingKind(err)
-	if kind != model.ProcessingErrorCompile && kind != model.ProcessingErrorExecution && kind != model.ProcessingErrorInvalidOutput && kind != model.ProcessingErrorResourceLimit && kind != model.ProcessingErrorTimeout {
+	if kind != model.ProcessingErrorCompile && kind != model.ProcessingErrorExecution && kind != model.ProcessingErrorInvalidOutput && kind != model.ProcessingErrorResourceLimit && kind != model.ProcessingErrorTimeout && kind != model.ProcessingErrorBodyLimitExceeded && kind != model.ProcessingErrorOutputLimitExceeded && kind != model.ProcessingErrorCapacityExhausted {
 		return false
 	}
 	if entry.FailOpenSafe == nil {
@@ -508,7 +548,13 @@ func closeResources(resources []io.Closer) error {
 
 func classifyBody(err error, phase model.Phase, processorID string, invocationID model.InvocationID) error {
 	kind := model.ProcessingErrorBodyRead
-	if errors.Is(err, model.ErrResourceLimit) || errors.Is(err, model.ErrBodyLimit) {
+	if errors.Is(err, model.ErrCleanupFailure) {
+		kind = model.ProcessingErrorCleanupFailure
+	} else if errors.Is(err, model.ErrBodyLimit) {
+		kind = model.ProcessingErrorBodyLimitExceeded
+	} else if errors.Is(err, model.ErrCapacityExhausted) {
+		kind = model.ProcessingErrorCapacityExhausted
+	} else if errors.Is(err, model.ErrResourceLimit) {
 		kind = model.ProcessingErrorResourceLimit
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		kind = model.ProcessingErrorTimeout
@@ -526,18 +572,36 @@ func classify(err error, phase model.Phase, processorID string, invocationID mod
 	}
 	var existing *model.ProcessingError
 	if errors.As(err, &existing) {
-		if errors.Is(err, errExecutionResourceCleanup) {
-			return model.NewProcessingError(existing.Kind, existing.Origin, existing.Phase, existing.ProcessorID, existing.InvocationID, err)
+		if errors.Is(err, errExecutionResourceCleanup) || errors.Is(err, model.ErrCleanupFailure) {
+			return model.NewProcessingError(model.ProcessingErrorCleanupFailure, existing.Origin, existing.Phase, existing.ProcessorID, existing.InvocationID, err)
+		}
+		if errors.Is(err, model.ErrIrreversibleIO) {
+			return model.NewProcessingError(model.ProcessingErrorIrreversibleIOFailure, existing.Origin, existing.Phase, existing.ProcessorID, existing.InvocationID, err)
+		}
+		if errors.Is(err, model.ErrGenerationRetired) {
+			return model.NewProcessingError(model.ProcessingErrorGenerationRetired, existing.Origin, existing.Phase, existing.ProcessorID, existing.InvocationID, err)
 		}
 		return existing
 	}
 	kind := model.ProcessingErrorExecution
 	switch {
+	case errors.Is(err, errExecutionResourceCleanup), errors.Is(err, model.ErrCleanupFailure):
+		kind = model.ProcessingErrorCleanupFailure
+	case errors.Is(err, model.ErrIrreversibleIO):
+		kind = model.ProcessingErrorIrreversibleIOFailure
+	case errors.Is(err, model.ErrGenerationRetired):
+		kind = model.ProcessingErrorGenerationRetired
+	case errors.Is(err, model.ErrCapacityExhausted):
+		kind = model.ProcessingErrorCapacityExhausted
+	case errors.Is(err, model.ErrOutputLimit):
+		kind = model.ProcessingErrorOutputLimitExceeded
+	case errors.Is(err, model.ErrBodyLimit):
+		kind = model.ProcessingErrorBodyLimitExceeded
 	case errors.Is(err, context.DeadlineExceeded):
 		kind = model.ProcessingErrorTimeout
 	case errors.Is(err, context.Canceled):
 		kind = model.ProcessingErrorCanceled
-	case errors.Is(err, model.ErrResourceLimit), errors.Is(err, model.ErrBodyLimit):
+	case errors.Is(err, model.ErrResourceLimit):
 		kind = model.ProcessingErrorResourceLimit
 	case errors.Is(err, model.ErrClosed):
 		kind = model.ProcessingErrorClosed

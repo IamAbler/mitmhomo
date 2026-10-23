@@ -60,10 +60,16 @@ func (p *fakeProcessor) Close() error                         { return p.lifecyc
 func (p *fakeProcessor) WaitClosed(ctx context.Context) error { return p.lifecycle.WaitClosed(ctx) }
 
 type countingBody struct {
-	reader  *strings.Reader
-	readErr error
-	reads   atomic.Int64
-	closes  atomic.Int64
+	reader       *strings.Reader
+	readErr      error
+	readEntered  chan struct{}
+	readRelease  chan struct{}
+	readOnce     sync.Once
+	closeEntered chan struct{}
+	closeRelease chan struct{}
+	closeOnce    sync.Once
+	reads        atomic.Int64
+	closes       atomic.Int64
 }
 
 func newCountingBody(text string) *countingBody {
@@ -71,12 +77,22 @@ func newCountingBody(text string) *countingBody {
 }
 func (b *countingBody) Read(p []byte) (int, error) {
 	b.reads.Add(1)
+	if b.readEntered != nil {
+		b.readOnce.Do(func() { close(b.readEntered) })
+		<-b.readRelease
+	}
 	if b.readErr != nil {
 		return 0, b.readErr
 	}
 	return b.reader.Read(p)
 }
-func (b *countingBody) Close() error { b.closes.Add(1); return nil }
+func (b *countingBody) Close() error {
+	b.closes.Add(1)
+	if b.closeEntered != nil {
+		b.closeOnce.Do(func() { close(b.closeEntered); <-b.closeRelease })
+	}
+	return nil
+}
 
 type countCloser struct{ closes atomic.Int64 }
 
@@ -100,7 +116,7 @@ func newTransaction(t testing.TB, id, body string) (*model.Transaction, *model.L
 	return newTransactionConfigured(t, id, "conn-"+id, "stream-1", reader, declared)
 }
 
-func newTransactionConfigured(t testing.TB, id, connectionID, streamID string, reader *countingBody, declaredLength int64) (*model.Transaction, *model.Ledger, *countingBody) {
+func newTransactionConfigured(t testing.TB, id, connectionID, streamID string, reader *countingBody, declaredLength int64, limits ...model.ResourceLimits) (*model.Transaction, *model.Ledger, *countingBody) {
 	t.Helper()
 	ledger, err := model.NewLedger(-1, nil)
 	if err != nil {
@@ -129,10 +145,14 @@ func newTransactionConfigured(t testing.TB, id, connectionID, streamID string, r
 		t.Fatal(err)
 	}
 	slot := model.NewBodySlot(broker)
-	tx, err := model.NewTransaction(context.Background(), model.TransactionOptions{
+	options := model.TransactionOptions{
 		ID: id, Generation: 7, Connection: model.ConnectionView{ID: connectionID, StreamID: streamID, Downstream: model.ProtocolInfo{Major: 2, Known: true}},
 		OriginalIngress: request, Request: request, RequestBody: slot, Ledger: ledger,
-	})
+	}
+	if len(limits) > 0 {
+		options.Limits = &limits[0]
+	}
+	tx, err := model.NewTransaction(context.Background(), options)
 	_ = lease.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +163,7 @@ func newTransactionConfigured(t testing.TB, id, connectionID, streamID string, r
 			t.Errorf("transaction leaked %d budget bytes", got)
 		}
 	})
-	return tx, ledger, reader
+	return tx, tx.Ledger(), reader
 }
 
 func mustRequestChange(t testing.TB, ledger *model.Ledger, patch model.RequestPatch) model.DoneResult {
@@ -465,6 +485,10 @@ func TestExecutionResourceCleanupFailureCannotFailOpen(t *testing.T) {
 	if err == nil || fake.starts.Load() != 0 || resource.closes.Load() != 1 || tx.State() != model.Terminated {
 		t.Fatalf("resource cleanup failure was masked: err=%v starts=%d closes=%d state=%d", err, fake.starts.Load(), resource.closes.Load(), tx.State())
 	}
+	var processing *model.ProcessingError
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorCleanupFailure {
+		t.Fatalf("resource cleanup error lost its category: %v", err)
+	}
 }
 
 func TestInvocationCleanupFailureCannotFailOpen(t *testing.T) {
@@ -481,6 +505,10 @@ func TestInvocationCleanupFailureCannotFailOpen(t *testing.T) {
 	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
 	if err == nil || resource.closes.Load() != 1 || fake.lifecycle.Active() != 0 || tx.State() != model.Terminated {
 		t.Fatalf("Invocation cleanup failure was masked: err=%v closes=%d active=%d state=%d", err, resource.closes.Load(), fake.lifecycle.Active(), tx.State())
+	}
+	var processing *model.ProcessingError
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorCleanupFailure {
+		t.Fatalf("Invocation cleanup error lost its category: %v", err)
 	}
 }
 
@@ -760,7 +788,7 @@ func TestDescriptorTotalTimeoutCancelsAwaitWithoutReleasingExecutionLease(t *tes
 		completion *processor.Completion
 	}
 	started := make(chan pending, 1)
-	fake := newFake(t, "total-timeout", processor.Requirements{TotalTimeout: time.Nanosecond}, func(inv *processor.Invocation, completion *processor.Completion, _ model.Input) {
+	fake := newFake(t, "total-timeout", processor.Requirements{TotalTimeout: 100 * time.Millisecond}, func(inv *processor.Invocation, completion *processor.Completion, _ model.Input) {
 		started <- pending{invocation: inv, completion: completion}
 	})
 	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
@@ -791,6 +819,261 @@ func TestDescriptorTotalTimeoutCancelsAwaitWithoutReleasingExecutionLease(t *tes
 	_ = runner.Close()
 	if err := runner.WaitClosed(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestM49BodyDeadlineReturnsBeforeNonCooperativeReaderAndKeepsItsOwner(t *testing.T) {
+	reader := newCountingBody("body")
+	reader.readEntered = make(chan struct{})
+	reader.readRelease = make(chan struct{})
+	defer func() {
+		select {
+		case <-reader.readRelease:
+		default:
+			close(reader.readRelease)
+		}
+	}()
+	tx, ledger, _ := newTransactionConfigured(t, "m49-body-deadline", "conn-body", "stream-body", reader, 4)
+	pool := processor.NewInvocationPool(1)
+	fake := newFake(t, "body-deadline", processor.Requirements{Body: model.FullBuffered, MaxBodyBytes: 8, TotalTimeout: 40 * time.Millisecond}, nil)
+	runner, err := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{InvocationPool: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type runResult struct{ err error }
+	done := make(chan runResult, 1)
+	go func() { _, err := runner.Run(context.Background(), tx, model.RequestPhase); done <- runResult{err} }()
+	select {
+	case <-reader.readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Body Reader did not enter its barrier")
+	}
+	var result runResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Body deadline did not release the caller")
+	}
+	var processing *model.ProcessingError
+	if !errors.As(result.err, &processing) || processing.Kind != model.ProcessingErrorTimeout {
+		t.Fatalf("Body deadline classification mismatch: %v", result.err)
+	}
+	if fake.starts.Load() != 0 || pool.Occupied() != 0 || channelClosed(tx.BodyExecutionDone()) || reader.closes.Load() != 0 {
+		t.Fatal("timeout fabricated Body completion or retained an unused Invocation permit")
+	}
+	close(reader.readRelease)
+	select {
+	case <-tx.BodyExecutionDone():
+	case <-time.After(time.Second):
+		t.Fatal("late Body operation did not physically drain")
+	}
+	if reader.closes.Load() != 1 {
+		t.Fatal("late Body cleanup did not dispose the source exactly once")
+	}
+	if err := tx.Close(); err != nil || ledger.Current() != 0 {
+		t.Fatalf("Transaction cleanup leaked after Body drain: err=%v bytes=%d", err, ledger.Current())
+	}
+}
+
+func TestM49DefaultBodyBufferLimitRejectsAtOneMiBPlusOne(t *testing.T) {
+	reader := newCountingBody(strings.Repeat("b", (1<<20)+1))
+	tx, _, _ := newTransactionConfigured(t, "m49-body-limit", "conn-limit", "stream-limit", reader, (1<<20)+1)
+	fake := newFake(t, "default-body-limit", processor.Requirements{Body: model.FullBuffered}, nil)
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	var processing *model.ProcessingError
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorBodyLimitExceeded || !errors.Is(err, model.ErrBodyLimit) {
+		t.Fatalf("default Body cap did not reject the one-byte overrun: %v", err)
+	}
+	if fake.starts.Load() != 0 || reader.closes.Load() != 0 {
+		t.Fatal("oversize Body started the Processor or prematurely disposed its replay owner")
+	}
+}
+
+func TestM49ExecutionTimeoutAndInvocationCapacityRetainRealOwner(t *testing.T) {
+	tx, ledger, _ := newTransaction(t, "m49-execution-timeout", "")
+	pool := processor.NewInvocationPool(1)
+	type pending struct {
+		invocation *processor.Invocation
+		completion *processor.Completion
+	}
+	started := make(chan pending, 1)
+	fake := newFake(t, "execution-timeout", processor.Requirements{ExecutionTimeout: 100 * time.Millisecond}, func(inv *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		if _, ok := inv.Context().Deadline(); !ok {
+			t.Error("ExecutionTimeout was not propagated to Processor.Start")
+		}
+		started <- pending{invocation: inv, completion: completion}
+	})
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{InvocationPool: pool})
+	runDone := make(chan error, 1)
+	go func() { _, err := runner.Run(context.Background(), tx, model.RequestPhase); runDone <- err }()
+	handle := <-started
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("ExecutionTimeout did not return the caller")
+	}
+	var processing *model.ProcessingError
+	if !errors.As(runErr, &processing) || processing.Kind != model.ProcessingErrorTimeout || processing.Origin != model.ProcessingOriginProcessor {
+		t.Fatalf("ExecutionTimeout classification mismatch: %v", runErr)
+	}
+	if channelClosed(handle.invocation.ExecutionDone()) || pool.Occupied() != 1 || fake.lifecycle.Active() != 1 {
+		t.Fatal("timeout fabricated ExecutionDone or returned capacity early")
+	}
+
+	tx2, _, _ := newTransaction(t, "m49-capacity-reject", "")
+	fast := newFake(t, "capacity-recovery", processor.Requirements{}, nil)
+	second, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fast}}, Options{InvocationPool: pool})
+	_, err := second.Run(context.Background(), tx2, model.RequestPhase)
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorCapacityExhausted || fast.starts.Load() != 0 {
+		t.Fatalf("occupied Invocation capacity did not reject before Start: err=%v starts=%d", err, fast.starts.Load())
+	}
+	if !handle.completion.Finish(model.Continue(), nil) {
+		t.Fatal("late completion did not release the Invocation owner")
+	}
+	if pool.Occupied() != 0 || fake.lifecycle.Active() != 0 {
+		t.Fatal("Invocation capacity did not recover after ExecutionDone")
+	}
+	tx3, _, _ := newTransaction(t, "m49-capacity-recovered", "")
+	if report, err := second.Run(context.Background(), tx3, model.RequestPhase); err != nil || report.Outcome != ContinueUpstream {
+		t.Fatalf("recovered Invocation capacity was not reusable: report=%+v err=%v", report, err)
+	}
+	if ledger.Current() < 0 {
+		t.Fatal("invalid byte accounting")
+	}
+	_ = runner.Close()
+	_ = second.Close()
+	if err := runner.WaitClosed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.WaitClosed(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestM49PhaseDeadlineBoundsBodyReplacementCommit(t *testing.T) {
+	reader := newCountingBody("source")
+	reader.closeEntered = make(chan struct{})
+	reader.closeRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(reader.closeRelease) }) }
+	defer release()
+	tx, ledger, _ := newTransactionConfigured(t, "m49-phase-body-commit", "conn-phase-body", "stream-phase-body", reader, 6)
+	fake := newFake(t, "phase-body-commit", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, input model.Input) {
+		result, err := model.ChangeRequest(model.RequestPatch{Body: model.BodyEdit{Kind: model.BodyReplace, Bytes: []byte("new")}}, input.Ledger(), 8)
+		if err != nil {
+			finish(t, completion, model.DoneResult{}, err)
+			return
+		}
+		finish(t, completion, result, nil)
+	})
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: fake}}, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { _, err := runner.Run(ctx, tx, model.RequestPhase); returned <- err }()
+	select {
+	case <-reader.closeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Body replacement did not enter source disposal")
+	}
+	var runErr error
+	select {
+	case runErr = <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("phase deadline did not release the Body commit caller")
+	}
+	var processing *model.ProcessingError
+	if !errors.As(runErr, &processing) || processing.Kind != model.ProcessingErrorTimeout {
+		t.Fatalf("Body commit deadline classification mismatch: %v", runErr)
+	}
+	if tx.Revision() != 1 || tx.Outcome() != model.ExchangeAborted || channelClosed(tx.BodyExecutionDone()) || reader.closes.Load() != 1 {
+		t.Fatal("deadline committed a partial Head/Body change or fabricated physical completion")
+	}
+	release()
+	select {
+	case <-tx.BodyExecutionDone():
+	case <-time.After(time.Second):
+		t.Fatal("late Body commit did not physically drain")
+	}
+	if err := tx.Close(); err != nil || ledger.Current() != 0 || reader.closes.Load() != 1 {
+		t.Fatalf("late Body commit cleanup leaked or closed twice: err=%v bytes=%d closes=%d", err, ledger.Current(), reader.closes.Load())
+	}
+}
+
+func TestM49OutputLimitFailOpenRollsBackOnlyCurrentProcessor(t *testing.T) {
+	tx, _, _ := newTransaction(t, "m49-output-rollback", "")
+	large := strings.Repeat("x", (1<<20)+1)
+	failing := newFake(t, "output-limit", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, input model.Input) {
+		result, err := model.ChangeRequest(model.RequestPatch{Headers: []model.HeaderEdit{{Kind: model.HeaderSet, Name: "X-Large", Values: []string{large}}}}, input.Ledger(), 2<<20)
+		if err != nil {
+			finish(t, completion, model.DoneResult{}, err)
+			return
+		}
+		finish(t, completion, result, nil)
+	})
+	recovered := newFake(t, "after-output-limit", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, input model.Input) {
+		if _, present, err := input.Request().Headers.Values("X-Large"); err != nil || present {
+			t.Errorf("failed Processor output was partially committed: present=%t err=%v", present, err)
+		}
+		result := mustRequestChange(t, input.Ledger(), model.RequestPatch{Headers: []model.HeaderEdit{{Kind: model.HeaderSet, Name: "X-Recovered", Values: []string{"yes"}}}})
+		finish(t, completion, result, nil)
+	})
+	runner, _ := NewRunner([]Entry{
+		{Class: Script, Processor: failing, AllowFailOpen: true, FailOpenSafe: func(error) bool { return true }},
+		{Class: Rewrite, Processor: recovered},
+	}, Options{})
+	report, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	if err != nil || report.Outcome != ContinueUpstream || len(report.Recoveries) != 1 || report.Recoveries[0].Kind != model.ProcessingErrorOutputLimitExceeded || tx.Revision() != 3 {
+		t.Fatalf("bounded fail-open did not isolate the failed Processor: report=%+v revision=%d err=%v", report, tx.Revision(), err)
+	}
+}
+
+func TestM49TransactionBudgetAccumulatesAcrossProcessors(t *testing.T) {
+	limits := model.DefaultResourceLimits()
+	limits.TransactionBytes = 28 << 10
+	limits.ProcessorOutputBytes = 8 << 10
+	tx, _, _ := newTransactionConfigured(t, "m49-cumulative-budget", "conn-budget", "stream-budget", nil, 0, limits)
+	firstValue := strings.Repeat("a", 6<<10)
+	secondValue := strings.Repeat("b", 6<<10)
+	makeWriter := func(name, value string) *fakeProcessor {
+		return newFake(t, name, processor.Requirements{MaxOutputBytes: 8 << 10}, func(_ *processor.Invocation, completion *processor.Completion, input model.Input) {
+			result, err := model.ChangeRequest(model.RequestPatch{Headers: []model.HeaderEdit{{Kind: model.HeaderSet, Name: "X-" + name, Values: []string{value}}}}, input.Ledger(), 1)
+			if err != nil {
+				finish(t, completion, model.DoneResult{}, err)
+				return
+			}
+			finish(t, completion, result, nil)
+		})
+	}
+	first, second := makeWriter("BudgetFirst", firstValue), makeWriter("BudgetSecond", secondValue)
+	runner, _ := NewRunner([]Entry{{Class: Rewrite, Processor: first}, {Class: Rewrite, Processor: second}}, Options{})
+	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	var processing *model.ProcessingError
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorResourceLimit || tx.Revision() != 2 {
+		t.Fatalf("multi-Processor output bypassed the Transaction ledger or committed partially: revision=%d err=%v", tx.Revision(), err)
+	}
+}
+
+func TestM49IrreversibleIOCannotFailOpen(t *testing.T) {
+	tx, _, _ := newTransaction(t, "m49-irreversible", "")
+	var fallback atomic.Int64
+	failing := newFake(t, "irreversible", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		finish(t, completion, model.DoneResult{}, errors.Join(model.ErrIrreversibleIO, errors.New("external write already happened")))
+	})
+	next := newFake(t, "should-not-run", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, _ model.Input) {
+		fallback.Add(1)
+		finish(t, completion, model.Continue(), nil)
+	})
+	runner, _ := NewRunner([]Entry{
+		{Class: Script, Processor: failing, AllowFailOpen: true, FailOpenSafe: func(error) bool { return true }},
+		{Class: Rewrite, Processor: next},
+	}, Options{})
+	_, err := runner.Run(context.Background(), tx, model.RequestPhase)
+	var processing *model.ProcessingError
+	if !errors.As(err, &processing) || processing.Kind != model.ProcessingErrorIrreversibleIOFailure || fallback.Load() != 0 || tx.State() != model.Terminated {
+		t.Fatalf("irreversible failure was opened: err=%v fallback=%d state=%d", err, fallback.Load(), tx.State())
 	}
 }
 

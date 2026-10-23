@@ -89,7 +89,8 @@ func newInvocation(ctx context.Context, key model.InvocationKey, processorID str
 		return i, c
 	}
 	if cause := context.Cause(ctx); ctx.Err() != nil {
-		i.terminalize(contextError(cause, model.ProcessingOriginRequest, key, processorID), false)
+		origin := model.TimeoutScopeOrigin(model.TimeoutScopeOf(ctx))
+		i.terminalize(contextError(cause, origin, key, processorID), false)
 		return i, c
 	}
 	return i, c
@@ -112,7 +113,7 @@ func NewInvocationWithResources(ctx context.Context, key model.InvocationKey, re
 		ctx = context.Background()
 	}
 	if ctx.Err() != nil {
-		return nil, nil, contextError(context.Cause(ctx), model.ProcessingOriginRequest, key, "")
+		return nil, nil, contextError(context.Cause(ctx), model.TimeoutScopeOrigin(model.TimeoutScopeOf(ctx)), key, "")
 	}
 	for _, resource := range resources {
 		if resource == nil {
@@ -374,10 +375,18 @@ func (i *Invocation) Await(ctx context.Context) (model.DoneResult, error) {
 			continue
 		case <-i.parentCtx.Done():
 			cause := context.Cause(i.parentCtx)
-			i.terminalize(contextError(cause, model.ProcessingOriginRequest, i.key, i.processorID), true)
+			origin := model.ProcessingOriginRequest
+			if scope := model.TimeoutScopeOf(i.parentCtx); scope != model.TimeoutScopeUnknown {
+				origin = model.TimeoutScopeOrigin(scope)
+			}
+			i.terminalize(contextError(cause, origin, i.key, i.processorID), true)
 		case <-ctx.Done():
 			cause := context.Cause(ctx)
-			i.terminalize(contextError(cause, model.ProcessingOriginProcessor, i.key, i.processorID), true)
+			origin := model.ProcessingOriginProcessor
+			if scope := model.TimeoutScopeOf(ctx); scope != model.TimeoutScopeUnknown {
+				origin = model.TimeoutScopeOrigin(scope)
+			}
+			i.terminalize(contextError(cause, origin, i.key, i.processorID), true)
 		}
 	}
 }

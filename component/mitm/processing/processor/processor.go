@@ -26,6 +26,9 @@ type Requirements struct {
 	Body model.BodyNeed
 	// MaxBodyBytes caps a complete FullBuffered body. It must be zero for None.
 	MaxBodyBytes int64
+	// MaxOutputBytes caps the immutable DoneResult allocation. Zero uses the
+	// owning Transaction's bounded default.
+	MaxOutputBytes int64
 	// TotalTimeout is the whole invocation wait budget; zero inherits the parent.
 	TotalTimeout time.Duration
 	// ExecutionTimeout is the backend's execution budget, separate from TotalTimeout.
@@ -53,7 +56,7 @@ func (d Descriptor) Clone() Descriptor {
 }
 
 func validRequirements(r Requirements) bool {
-	if r.Body != model.None && r.Body != model.FullBuffered || r.MaxBodyBytes < 0 || r.TotalTimeout < 0 || r.ExecutionTimeout < 0 {
+	if r.Body != model.None && r.Body != model.FullBuffered || r.MaxBodyBytes < 0 || r.MaxOutputBytes < 0 || r.TotalTimeout < 0 || r.ExecutionTimeout < 0 {
 		return false
 	}
 	return r.Body == model.FullBuffered || r.MaxBodyBytes == 0
@@ -65,7 +68,7 @@ func emptyRequirements(r Requirements) bool {
 
 func (d Descriptor) Validate() error {
 	if d.ID == "" || d.Backend == "" || d.ContractVersion == 0 || !d.Request && !d.Response || !validRequirements(d.RequestNeeds) || !validRequirements(d.ResponseNeeds) {
-		return model.NewProcessingError(model.ProcessingErrorInvalidInput, model.ProcessingOriginProcessor, model.PhaseInvalid, d.ID, "", model.ErrInvalid)
+		return model.NewProcessingError(model.ProcessingErrorInvalidConfiguration, model.ProcessingOriginProcessor, model.PhaseInvalid, d.ID, "", model.ErrInvalid)
 	}
 	if !d.Request && !emptyRequirements(d.RequestNeeds) || !d.Response && !emptyRequirements(d.ResponseNeeds) {
 		return model.NewProcessingError(model.ProcessingErrorInvalidInput, model.ProcessingOriginProcessor, model.PhaseInvalid, d.ID, "", model.ErrInvalid)

@@ -514,6 +514,15 @@ func (r DoneResult) Valid() bool {
 // payload. Completion uses it to avoid releasing a payload on duplicate Finish.
 func (r DoneResult) Same(other DoneResult) bool { return r.payload == other.payload }
 
+// AllocatedBytes reports the live bytes charged to this result's immutable
+// payload lease. It is used for admission before Transaction.Commit.
+func (r DoneResult) AllocatedBytes() int64 {
+	if r.payload == nil || r.payload.storage == nil || r.payload.storage.lease == nil {
+		return 0
+	}
+	return r.payload.storage.lease.ChargedBytes()
+}
+
 func (r DoneResult) ValidateForPhase(phase Phase) error {
 	if !r.Valid() || phase != RequestPhase && phase != ResponsePhase {
 		return ErrInvalid

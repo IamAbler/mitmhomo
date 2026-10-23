@@ -113,6 +113,9 @@ func (g *Generation) cleanup() {
 			err = errors.Join(err, g.resources[i].Close())
 		}
 	}
+	if err != nil {
+		err = errors.Join(model.ErrCleanupFailure, err)
+	}
 	g.mu.Lock()
 	g.resources = nil
 	g.err = err

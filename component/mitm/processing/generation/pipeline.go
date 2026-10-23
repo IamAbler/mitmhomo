@@ -30,6 +30,10 @@ func (p planResources) Close() error {
 	return errors.Join(p.runner.Close(), p.runner.WaitClosed(context.Background()))
 }
 
+func retiredProcessingError(phase model.Phase, cause error) error {
+	return model.NewProcessingError(model.ProcessingErrorGenerationRetired, model.ProcessingOriginConnection, phase, "", "", errors.Join(model.ErrGenerationRetired, cause))
+}
+
 // BuildError retains exclusive ownership of ALL partial resources. Returning
 // it never calls a potentially blocking Close. The receiver must arrange
 // cleanup of Pending (or attach a pre-reserved cleanup owner), then WaitClosed.
@@ -96,11 +100,11 @@ func (r *BoundRunner) Run(ctx context.Context, tx *model.Transaction, phase mode
 		return pipeline.Report{}, model.ErrInvalid
 	}
 	if tx.GenerationID() != r.parent.ID() {
-		return pipeline.Report{}, ErrUnavailable
+		return pipeline.Report{}, retiredProcessingError(phase, ErrUnavailable)
 	}
 	lease, err := r.parent.Transaction()
 	if err != nil {
-		return pipeline.Report{}, err
+		return pipeline.Report{}, retiredProcessingError(phase, err)
 	}
 	defer lease.Close()
 	runner, err := pipeline.NewRunner(r.entries, pipeline.Options{AcquireGeneration: func(ctx context.Context, id model.GenerationID) (io.Closer, error) {
@@ -112,7 +116,7 @@ func (r *BoundRunner) Run(ctx context.Context, tx *model.Transaction, phase mode
 		}
 		lease, err := lease.Execution()
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(model.ErrGenerationRetired, err)
 		}
 		return &executionPin{lease}, nil
 	}})

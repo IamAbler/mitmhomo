@@ -27,7 +27,9 @@ func NewBodyExecutionPool(capacity int64) *BodyExecutionPool {
 	return &BodyExecutionPool{ledger}
 }
 func (p *BodyExecutionPool) Occupied() int64 { return p.ledger.Current() }
-func errorsJoinBodyCapacity(err error) error { return errors.Join(ErrBodyCapacity, err) }
+func errorsJoinBodyCapacity(err error) error {
+	return errors.Join(ErrBodyCapacity, ErrCapacityExhausted, err)
+}
 
 type bodyReservation struct{ *Reservation }
 
@@ -36,7 +38,9 @@ func closeBodyResources(resources []io.Closer) error {
 	var err error
 	for i := len(resources) - 1; i >= 0; i-- {
 		if resources[i] != nil {
-			err = errors.Join(err, resources[i].Close())
+			if closeErr := resources[i].Close(); closeErr != nil {
+				err = errors.Join(err, ErrCleanupFailure, closeErr)
+			}
 		}
 	}
 	return err

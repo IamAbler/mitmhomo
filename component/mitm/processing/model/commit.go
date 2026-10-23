@@ -156,8 +156,24 @@ func (t *Transaction) DecisionCopy(to *CopyLease) (ExchangeOutcome, string, stri
 // all run under the Transaction owner lock. It is the only M4.7 entry point
 // that applies Processor-produced changes.
 func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error) {
+	return t.CommitContext(t.ctx, input, result)
+}
+
+// CommitContext applies a result only while the owning phase context is live.
+// It also passes that context to Body replacement so a shorter Request/Response
+// phase deadline can revoke a slow disposal without releasing its physical owner.
+func (t *Transaction) CommitContext(ctx context.Context, input Input, result DoneResult) (ResultKind, error) {
+	if ctx == nil {
+		ctx = t.ctx
+	}
+	if err := context.Cause(ctx); ctx.Err() != nil {
+		return ResultInvalid, err
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err := context.Cause(ctx); ctx.Err() != nil {
+		return ResultInvalid, err
+	}
 	key := input.key
 	if err := t.check(key.Revision); err != nil {
 		return ResultInvalid, err
@@ -191,7 +207,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 				lease.Close()
 				return ResultInvalid, ErrBodyUnavailable
 			}
-			err := t.replaceForCommit(input, broker, patch.Body.Bytes, func() {
+			err := t.replaceForCommit(ctx, input, broker, patch.Body.Bytes, func() {
 				old := t.requestLease
 				t.request, t.requestLease = head, lease
 				t.revision++
@@ -224,7 +240,7 @@ func (t *Transaction) Commit(input Input, result DoneResult) (ResultKind, error)
 				lease.Close()
 				return ResultInvalid, ErrBodyUnavailable
 			}
-			err := t.replaceForCommit(input, broker, patch.Body.Bytes, func() {
+			err := t.replaceForCommit(ctx, input, broker, patch.Body.Bytes, func() {
 				old := t.responseLease
 				t.response, t.responseLease = head, lease
 				t.revision++
@@ -457,10 +473,19 @@ func (s SyntheticResponse) cloneTo(ledger *Ledger) (SyntheticResponse, error) {
 // replaceForCommit preserves atomic Head/Body publication while the source's
 // Read/Close and logical waiting happen outside the Transaction state lock.
 // The caller holds mu on entry and again on return.
-func (t *Transaction) replaceForCommit(input Input, broker *BodyBroker, data []byte, apply func()) error {
+func (t *Transaction) replaceForCommit(ctx context.Context, input Input, broker *BodyBroker, data []byte, apply func()) error {
+	if int64(len(data)) > t.limits.BodyBufferBytes {
+		return ErrBodyLimit
+	}
+	if ctx == nil {
+		ctx = t.ctx
+	}
+	if err := context.Cause(ctx); ctx.Err() != nil {
+		return err
+	}
 	committed := false
 	t.mu.Unlock()
-	err := broker.replace(t.ctx, data, func(publish func() error) error {
+	err := broker.replace(ctx, data, func(publish func() error) error {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		if err := t.check(input.key.Revision); err != nil {

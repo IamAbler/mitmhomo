@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"sync"
+
+	"github.com/metacubex/mihomo/component/mitm/processing/model"
 )
 
-var ErrCleanupCapacity = errors.New("generation cleanup ownership capacity exhausted")
+var ErrCleanupCapacity = errors.Join(model.ErrCapacityExhausted, errors.New("generation cleanup ownership capacity exhausted"))
 
 // CleanupPool bounds retained owners AND goroutines. Reserve must precede
 // resource construction; a blocked destructor retains its slot until real exit.

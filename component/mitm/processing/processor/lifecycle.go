@@ -71,8 +71,9 @@ func (l *Lifecycle) BeginWithResources(ctx context.Context, key model.Invocation
 		if errors.Is(cause, context.DeadlineExceeded) {
 			kind = model.ProcessingErrorTimeout
 		}
+		origin := model.TimeoutScopeOrigin(model.TimeoutScopeOf(ctx))
 		l.mu.Unlock()
-		return nil, nil, lifecycleError(kind, key, l.processorID, cause)
+		return nil, nil, model.NewProcessingError(kind, origin, key.Phase, l.processorID, key.Invocation, cause)
 	}
 	if len(l.active) >= l.capacity {
 		l.mu.Unlock()

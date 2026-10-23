@@ -3,9 +3,11 @@ package generation
 import (
 	"context"
 	"errors"
-	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
 	"sync"
 	"testing"
+
+	"github.com/metacubex/mihomo/component/mitm/processing/model"
+	"github.com/metacubex/mihomo/component/mitm/processing/pipeline"
 )
 
 func TestDeferredRetireAndExecutionReleaseCompetition(t *testing.T) {
@@ -53,7 +55,7 @@ func TestFailedPlanReturnsExplicitOwnerWithoutClosing(t *testing.T) {
 	if !errors.Is(failure.Pending.WaitClosed(canceled), context.Canceled) {
 		t.Fatal("wait did not cancel")
 	}
-	if _, e = pool.Reserve(); !errors.Is(e, ErrCleanupCapacity) {
+	if _, e = pool.Reserve(); !errors.Is(e, ErrCleanupCapacity) || !errors.Is(e, model.ErrCapacityExhausted) {
 		t.Fatal("blocked cleanup lost its reservation")
 	}
 	close(resource.release)

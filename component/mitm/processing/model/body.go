@@ -148,6 +148,22 @@ func (b *BodyBroker) attachContext(ctx context.Context) {
 	b.bodyData.ownerContext = ctx
 }
 
+// attachLedger transfers a fresh broker's byte accounting into its owning
+// Transaction. It is only valid before any read, buffer, or replacement exists.
+func (b *BodyBroker) attachLedger(ledger *Ledger) error {
+	if b == nil || ledger == nil {
+		return ErrInvalid
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.operation != nil || b.bodyData.charge != nil || len(b.bodyData.data) != 0 || b.bodyData.state != UnreadStream && b.bodyData.state != Unavailable {
+		return ErrBodyBusy
+	}
+	b.ledger = ledger
+	b.bodyData.ledger = ledger
+	return nil
+}
+
 func (b *BodyBroker) Info() BodyInfo {
 	b.mu.Lock()
 	defer b.mu.Unlock()

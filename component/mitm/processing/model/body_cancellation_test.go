@@ -102,6 +102,79 @@ func TestBodyDeadlineReleasesCallerNotExecution(t *testing.T) {
 	}
 }
 
+func TestTransactionCloseUsesCleanupBudgetWithoutReleasingBlockedReader(t *testing.T) {
+	reader := newControlledBody()
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(reader.release) }) }
+	defer unblock()
+	pool := NewBodyExecutionPool(1)
+	ledger := testLedger(t, -1)
+	broker, err := NewBodyBroker(context.Background(), BodySource{Reader: reader, Owner: FrameworkOwned, DeclaredLength: -1, Executions: pool}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := DefaultTimeoutPolicy()
+	policy.CleanupWait = 25 * time.Millisecond
+	tx, metadata := testTransactionWithPolicy(t, context.Background(), ledger, NewBodySlot(broker), &policy)
+	metadata.Close()
+	prepared := make(chan error, 1)
+	go func() { prepared <- tx.PrepareBodyContext(context.Background(), FullBuffered, 16) }()
+	awaitBody(t, reader.entered)
+	if err = tx.Close(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close exceeded or ignored its cleanup wait budget: %v", err)
+	}
+	assertBodyOpen(t, broker.ExecutionDone())
+	if reader.closes.Load() != 0 || pool.Occupied() != 1 {
+		t.Fatal("cleanup timeout released a live Reader owner")
+	}
+	unblock()
+	if err = awaitBody(t, prepared); !errors.Is(err, context.Canceled) {
+		t.Fatalf("late body operation lost transaction cancellation: %v", err)
+	}
+	awaitBody(t, broker.ExecutionDone())
+	if err = tx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pool.Occupied() != 0 || reader.closes.Load() != 1 || ledger.Current() != 0 {
+		t.Fatalf("physical cleanup did not recover: pool=%d closes=%d bytes=%d", pool.Occupied(), reader.closes.Load(), ledger.Current())
+	}
+}
+
+func TestTransactionBodyIOTimeoutIsAppliedOutsidePipeline(t *testing.T) {
+	reader := newControlledBody()
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(reader.release) }) }
+	defer unblock()
+	pool := NewBodyExecutionPool(1)
+	ledger := testLedger(t, -1)
+	broker, err := NewBodyBroker(context.Background(), BodySource{Reader: reader, Owner: FrameworkOwned, DeclaredLength: -1, Executions: pool}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := DefaultTimeoutPolicy()
+	policy.BodyIO = 25 * time.Millisecond
+	tx, metadata := testTransactionWithPolicy(t, context.Background(), ledger, NewBodySlot(broker), &policy)
+	metadata.Close()
+	returned := make(chan error, 1)
+	go func() { returned <- tx.PrepareBodyContext(context.Background(), FullBuffered, 16) }()
+	awaitBody(t, reader.entered)
+	if err = awaitBody(t, returned); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Transaction BodyIO timeout did not reach the Reader: %v", err)
+	}
+	assertBodyOpen(t, broker.ExecutionDone())
+	if pool.Occupied() != 1 || reader.closes.Load() != 0 {
+		t.Fatal("BodyIO timeout released a live source owner")
+	}
+	unblock()
+	awaitBody(t, broker.ExecutionDone())
+	if err = tx.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pool.Occupied() != 0 || ledger.Current() != 0 || reader.closes.Load() != 1 {
+		t.Fatal("BodyIO timeout did not drain exactly once")
+	}
+}
+
 func TestBodyExplicitInterruptAndAdmission(t *testing.T) {
 	for _, interruptible := range []bool{false, true} {
 		t.Run(map[bool]string{false: "noncooperative", true: "interruptible"}[interruptible], func(t *testing.T) {

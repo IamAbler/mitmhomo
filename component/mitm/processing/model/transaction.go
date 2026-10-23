@@ -134,6 +134,8 @@ type TransactionOptions struct {
 	Request         RequestHead // Entry after any protocol/internal hook processing.
 	RequestBody     BodySlot
 	Ledger          *Ledger
+	Timeouts        *TimeoutPolicy
+	Limits          *ResourceLimits
 }
 
 // GenerationID is immutable for the entire transaction lifetime.
@@ -147,7 +149,10 @@ type Transaction struct {
 	mu                                        sync.Mutex
 	ctx                                       context.Context
 	cancel                                    context.CancelCauseFunc
+	stopTimeout                               context.CancelFunc
 	ledger                                    *Ledger
+	timeouts                                  TimeoutPolicy
+	limits                                    ResourceLimits
 	id                                        string
 	generation                                GenerationID
 	connection                                ConnectionView
@@ -187,14 +192,32 @@ func NewTransaction(parent context.Context, options TransactionOptions) (*Transa
 	if parent.Err() != nil {
 		return nil, context.Cause(parent)
 	}
-	ctx, cancel := context.WithCancelCause(parent)
+	timeouts := DefaultTimeoutPolicy()
+	if options.Timeouts != nil {
+		timeouts = *options.Timeouts
+	}
+	if !timeouts.valid() {
+		return nil, ErrInvalid
+	}
+	limits := DefaultResourceLimits()
+	if options.Limits != nil {
+		limits = *options.Limits
+	}
+	if !limits.valid() {
+		return nil, ErrInvalid
+	}
+	transactionLedger, err := newTransactionLedger(options.Ledger, limits.TransactionBytes)
+	if err != nil {
+		return nil, err
+	}
+	transactionParent, stopTimeout := WithTimeoutScope(parent, timeouts.Transaction, TimeoutScopeTransaction)
+	ctx, cancel := context.WithCancelCause(transactionParent)
 	gate := make(chan struct{}, 1)
 	gate <- struct{}{}
-	t := &Transaction{ctx: ctx, cancel: cancel, ledger: options.Ledger, generation: options.Generation, phase: RequestPhase, revision: 1, requestBody: options.RequestBody, pipelineGate: gate}
+	t := &Transaction{ctx: ctx, cancel: cancel, stopTimeout: stopTimeout, ledger: transactionLedger, timeouts: timeouts, limits: limits, generation: options.Generation, phase: RequestPhase, revision: 1, requestBody: options.RequestBody, pipelineGate: gate}
 	t.ingressLease = NewCopyLease(t.ledger)
 	t.entryLease = NewCopyLease(t.ledger)
 	t.requestLease = NewCopyLease(t.ledger)
-	var err error
 	success := false
 	defer func() {
 		if !success {
@@ -202,6 +225,7 @@ func NewTransaction(parent context.Context, options TransactionOptions) (*Transa
 			t.entryLease.Close()
 			t.requestLease.Close()
 			cancel(context.Canceled)
+			stopTimeout()
 		}
 	}()
 	t.id, t.connection, t.route, err = cloneMetadata(t.ingressLease, options.ID, options.Connection, options.Route)
@@ -220,10 +244,13 @@ func NewTransaction(parent context.Context, options TransactionOptions) (*Transa
 	if err != nil {
 		return nil, err
 	}
-	success = true
 	if b := t.requestBody.broker; b != nil {
+		if err := b.attachLedger(t.ledger); err != nil {
+			return nil, err
+		}
 		b.attachContext(ctx)
 	}
+	success = true
 	return t, nil
 }
 
@@ -258,6 +285,8 @@ func cloneMetadata(to *CopyLease, id string, connection ConnectionView, route Ro
 func (t *Transaction) Context() context.Context    { return t.ctx }
 func (t *Transaction) Deadline() (time.Time, bool) { return t.ctx.Deadline() }
 func (t *Transaction) CancellationCause() error    { return context.Cause(t.ctx) }
+func (t *Transaction) Timeouts() TimeoutPolicy     { return t.timeouts }
+func (t *Transaction) Limits() ResourceLimits      { return t.limits }
 func (t *Transaction) Revision() Revision          { t.mu.Lock(); defer t.mu.Unlock(); return t.revision }
 func (t *Transaction) Phase() Phase                { t.mu.Lock(); defer t.mu.Unlock(); return t.phase }
 func (t *Transaction) State() TransactionState     { t.mu.Lock(); defer t.mu.Unlock(); return t.state }
@@ -332,6 +361,14 @@ func (t *Transaction) EnterResponse(expected Revision, original, entry ResponseH
 	work, err := entry.clone(workLease)
 	if err != nil {
 		return err
+	}
+	// Response bodies enter after Transaction construction, so attach their
+	// accounting before ownership moves into the Transaction. This keeps request
+	// and response buffers under the same per-Transaction and framework budgets.
+	if body.broker != nil {
+		if err := body.broker.attachLedger(t.ledger); err != nil {
+			return err
+		}
 	}
 	t.entryLease.Close()
 	t.originalResponseLease, t.entryLease, t.responseLease = originalLease, entryLease, workLease
@@ -412,7 +449,12 @@ func (t *Transaction) PrepareBodyContext(ctx context.Context, need BodyNeed, lim
 		}
 		return ErrBodyUnavailable
 	}
-	return b.prepare(ctx, need, limit, func(publish func() error) error {
+	if need == FullBuffered && limit > t.limits.BodyBufferBytes {
+		limit = t.limits.BodyBufferBytes
+	}
+	bodyCtx, cancelBody := WithTimeoutScope(ctx, t.timeouts.BodyIO, TimeoutScopeBody)
+	defer cancelBody()
+	return b.prepare(bodyCtx, need, limit, func(publish func() error) error {
 		t.mu.Lock()
 		defer t.mu.Unlock()
 		if err := t.check(revision); err != nil {
@@ -428,6 +470,9 @@ func (t *Transaction) PrepareBodyContext(ctx context.Context, need BodyNeed, lim
 func (t *Transaction) ReplaceBody(expected Revision, data []byte) error {
 	t.mu.Lock()
 	err := t.check(expected)
+	if err == nil && int64(len(data)) > t.limits.BodyBufferBytes {
+		err = ErrBodyLimit
+	}
 	if err == nil && t.outcome != ExchangePending && !(t.phase == ResponsePhase && t.outcome == ExchangeUpstreamIssued) {
 		err = ErrClosed
 	}
@@ -476,6 +521,7 @@ func (t *Transaction) Terminate(cause error) {
 		cause = context.Canceled
 	}
 	t.cancel(cause) // Must precede locking: a cooperative in-flight read may wait.
+	t.stopTimeout()
 	t.mu.Lock()
 	if t.state == Active {
 		t.state = Terminated
@@ -497,6 +543,7 @@ func (t *Transaction) CloseLogical() {
 		return
 	}
 	t.cancel(context.Canceled)
+	t.stopTimeout()
 	t.mu.Lock()
 	if t.state != Closed {
 		t.state = Closed
@@ -532,15 +579,20 @@ func (t *Transaction) CloseContext(ctx context.Context) error {
 		return nil
 	}
 	t.CloseLogical()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupCtx, cancelCleanup := WithTimeoutScope(ctx, t.timeouts.CleanupWait, TimeoutScopeCleanup)
+	defer cancelCleanup()
 	t.mu.Lock()
 	requestBody, responseBody := t.requestBody.broker, t.responseBody.broker
 	err := t.closeErr
 	t.mu.Unlock()
 	if requestBody != nil {
-		err = errors.Join(err, requestBody.CloseContext(ctx))
+		err = errors.Join(err, requestBody.CloseContext(cleanupCtx))
 	}
 	if responseBody != nil {
-		err = errors.Join(err, responseBody.CloseContext(ctx))
+		err = errors.Join(err, responseBody.CloseContext(cleanupCtx))
 	}
 	return err
 }
@@ -556,6 +608,7 @@ type Input struct {
 	ingress, phaseRequest, request            RequestHead
 	originalResponse, phaseResponse, response ResponseHead
 	body                                      BodyView
+	ledger                                    *Ledger
 }
 
 func (i Input) Key() InvocationKey                  { return i.key }
@@ -569,6 +622,11 @@ func (i Input) OriginalPhaseResponse() ResponseHead { return i.phaseResponse }
 func (i Input) Request() RequestHead                { return i.request }
 func (i Input) Response() (ResponseHead, bool)      { return i.response, i.key.Phase == ResponsePhase }
 func (i Input) Body() BodyView                      { return i.body }
+
+// Ledger is the transaction-scoped output budget. Processor adapters should
+// use it when constructing DoneResult values so temporary outputs count against
+// both transaction and framework-wide budgets.
+func (i Input) Ledger() *Ledger { return i.ledger }
 
 func (t *Transaction) Snapshot(invocation InvocationID) (Input, *CopyLease, error) {
 	t.mu.Lock()
@@ -602,6 +660,7 @@ func (t *Transaction) Snapshot(invocation InvocationID) (Input, *CopyLease, erro
 	out.key.Phase = t.phase
 	out.key.Revision = t.revision
 	out.connection, out.route, out.origin = connection, route, t.origin
+	out.ledger = t.ledger
 	out.ingress, err = t.ingress.clone(lease)
 	if err != nil {
 		return Input{}, nil, err

@@ -115,3 +115,51 @@ func TestCopyLeaseCloseWaitsForAllocationPin(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDefaultTransactionAndFrameworkBudgetsAreSeparateAndBounded(t *testing.T) {
+	if DefaultTransactionBudgetBytes != 16<<20 || DefaultFrameworkBudgetBytes != 64<<20 || DefaultBodyBufferBytes != 1<<20 || DefaultProcessorOutputBytes != 1<<20 {
+		t.Fatal("default resource policy changed unexpectedly")
+	}
+	if current := defaultFrameworkBudget.Current(); current != 0 {
+		t.Fatalf("framework byte budget leaked before test: %d", current)
+	}
+	ledgers := make([]*Ledger, 4)
+	reservations := make([]*Reservation, 4)
+	for i := range ledgers {
+		base := testLedger(t, -1)
+		ledger, err := newTransactionLedger(base, DefaultTransactionBudgetBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledgers[i] = ledger
+		reservations[i], err = ledger.Reserve(DefaultTransactionBudgetBytes)
+		if err != nil {
+			t.Fatalf("transaction %d could not reserve its exact local limit: %v", i, err)
+		}
+	}
+	if got := defaultFrameworkBudget.Current(); got != DefaultFrameworkBudgetBytes {
+		t.Fatalf("framework cap not shared across transactions: %d", got)
+	}
+	if _, err := ledgers[0].Reserve(1); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("transaction-local limit was bypassed: %v", err)
+	}
+	base := testLedger(t, -1)
+	fifth, err := newTransactionLedger(base, DefaultTransactionBudgetBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fifth.Reserve(1); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("framework aggregate cap was bypassed: %v", err)
+	}
+	if fifth.Current() != 0 || base.Current() != 0 {
+		t.Fatal("failed multi-budget admission left a partial reservation")
+	}
+	for _, reservation := range reservations {
+		if !reservation.Release() || reservation.Release() {
+			t.Fatal("reservation release was not single-use")
+		}
+	}
+	if got := defaultFrameworkBudget.Current(); got != 0 {
+		t.Fatalf("framework budget did not recover: %d", got)
+	}
+}

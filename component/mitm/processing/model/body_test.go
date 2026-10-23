@@ -431,7 +431,7 @@ func TestBodyCloseErrorsAndUnavailable(t *testing.T) {
 	l := testLedger(t, -1)
 	b, source := testBody(t, context.Background(), strings.NewReader("x"), TransportOwned, 1, l)
 	source.closeErr = io.ErrClosedPipe
-	if err := b.Replace(context.Background(), []byte("y")); !errors.Is(err, io.ErrClosedPipe) {
+	if err := b.Replace(context.Background(), []byte("y")); !errors.Is(err, io.ErrClosedPipe) || !errors.Is(err, ErrCleanupFailure) {
 		t.Fatal(err)
 	}
 	if b.Info().State != Faulted || l.Current() != 0 {
