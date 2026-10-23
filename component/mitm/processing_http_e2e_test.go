@@ -364,6 +364,116 @@ func TestM52ResponseBodyTimeoutCancelsOnlyTheOwningRequest(t *testing.T) {
 	}
 }
 
+type m52BlockedReadBody struct {
+	entered  chan struct{}
+	release  <-chan struct{}
+	closed   chan struct{}
+	readOnce sync.Once
+	closeOne sync.Once
+}
+
+func (body *m52BlockedReadBody) Read(p []byte) (int, error) {
+	body.readOnce.Do(func() { close(body.entered) })
+	<-body.release
+	return copy(p, "released"), io.EOF
+}
+
+func (body *m52BlockedReadBody) Close() error {
+	body.closeOne.Do(func() { close(body.closed) })
+	return nil
+}
+
+func TestM52NonCooperativeRequestReaderDoesNotHoldHTTPHandler(t *testing.T) {
+	for _, h2 := range []bool{false, true} {
+		name := "http11"
+		if h2 {
+			name = "http2"
+		}
+		t.Run(name, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			closed := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseReader := func() { releaseOnce.Do(func() { close(release) }) }
+			reader := &m52BlockedReadBody{entered: entered, release: release, closed: closed}
+			var upstreamCalls atomic.Int32
+			h := m52ProtocolHarness(t, h2, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				upstreamCalls.Add(1)
+				_, _ = io.WriteString(w, request.URL.Path)
+			}), m52GojaFactory(t, gojaprocessor.Config{
+				ID:      "m52-blocked-request-reader",
+				Source:  `function process(input) { return {kind:"continue"}; }`,
+				Request: true, RequestBody: model.FullBuffered, RequestMaxBodyBytes: 1 << 20,
+				TotalTimeout: 150 * time.Millisecond,
+			}), func(config *Config) {
+				config.RequestHook = func(request *http.Request) error {
+					if request.URL.Path == "/blocked" {
+						request.Body = reader
+						request.ContentLength = -1
+					}
+					return nil
+				}
+			})
+			// Release before httptest cleanup if an assertion fails while the Body
+			// owner is still correctly retaining this deliberately blocked Reader.
+			t.Cleanup(releaseReader)
+
+			type roundTripResult struct {
+				response *http.Response
+				err      error
+			}
+			request, err := http.NewRequest(http.MethodGet, "https://localhost/blocked", nil)
+			require.NoError(t, err)
+			result := make(chan roundTripResult, 1)
+			go func() {
+				var response *http.Response
+				var roundTripErr error
+				if h2 {
+					response, roundTripErr = h.client.RoundTrip(request)
+				} else {
+					response, roundTripErr = h.wire.RoundTrip(request)
+				}
+				result <- roundTripResult{response: response, err: roundTripErr}
+			}()
+			select {
+			case <-entered:
+			case <-time.After(3 * time.Second):
+				t.Fatal("RequestPhase did not start the blocked Body Reader")
+			}
+			var response *http.Response
+			select {
+			case received := <-result:
+				require.NoError(t, received.err)
+				response = received.response
+			case <-time.After(3 * time.Second):
+				t.Fatal("HTTP handler waited for a non-cooperative Reader after request timeout")
+			}
+			require.Equal(t, http.StatusGatewayTimeout, response.StatusCode)
+			require.Contains(t, m52ReadResponse(t, response), "timed out")
+			select {
+			case <-closed:
+				t.Fatal("logical timeout released the blocked Reader before Read returned")
+			default:
+			}
+			if h2 {
+				sibling := m52RoundTrip(t, h, true, http.MethodGet, "/sibling", "")
+				require.Equal(t, "/sibling", m52ReadResponse(t, sibling), "one blocked HTTP/2 Body owner must not stall its sibling Stream")
+			}
+			wantCalls := int32(0)
+			if h2 {
+				wantCalls = 1
+			}
+			require.EqualValues(t, wantCalls, upstreamCalls.Load(), "the timed-out request must not reach the upstream")
+			releaseReader()
+			select {
+			case <-closed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("Body owner did not dispose the Reader after it physically returned")
+			}
+		})
+	}
+}
+
 func TestCommitTrackingWriterRecognizesHTTPCommitBoundaries(t *testing.T) {
 	t.Run("final headers commit without a body", func(t *testing.T) {
 		for _, status := range []int{http.StatusOK, http.StatusNoContent, http.StatusNotModified} {
