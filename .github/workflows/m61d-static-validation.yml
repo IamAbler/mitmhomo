@@ -1,0 +1,213 @@
+name: M6.1-D Static Link Validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - validation/m61-quickjs-ci
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m61d-static-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-quickjs-single-file:
+    name: QuickJS Windows single-file experiment
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: "1"
+      CC: gcc
+      GOOS: windows
+      GOARCH: amd64
+      GOTOOLCHAIN: local
+      MSYS_NO_PATHCONV: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go 1.26.10
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.26.10"
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          cache: false
+
+      - name: Prepare artifact directory and inspect toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/m61d-static/windows-amd64
+          {
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED CC=$CC"
+            go version
+            gcc --version
+            gcc -dumpmachine
+            gcc -print-search-dirs
+            ld --version
+            objdump --version
+            where.exe gcc
+            test "$(gcc -dumpmachine)" = "x86_64-w64-mingw32"
+          } 2>&1 | tee artifacts/m61d-static/windows-amd64/toolchain.log
+
+      - name: Run QuickJS package tests with the default MinGW link
+        run: |
+          set -euo pipefail
+          go test -tags quickjs -count=1 -timeout=3m ./component/quickjs 2>&1 \
+            | tee artifacts/m61d-static/windows-amd64/quickjs-package-tests.log
+
+      - name: Build every package with QuickJS enabled
+        run: |
+          set -euo pipefail
+          go build -x -p 2 -tags quickjs ./... 2>&1 \
+            | tee artifacts/m61d-static/windows-amd64/quickjs-project-build.log
+
+      - name: Build and start the current mitmhomo main program
+        run: |
+          set -euo pipefail
+          main_bin="artifacts/m61d-static/windows-amd64/mihomo-quickjs.exe"
+          go build -x -tags quickjs -o "$main_bin" . 2>&1 \
+            | tee artifacts/m61d-static/windows-amd64/quickjs-main-build.log
+          "$main_bin" -v 2>&1 \
+            | tee artifacts/m61d-static/windows-amd64/quickjs-main-smoke.log
+          echo "NOTE: this build step does not imply the main package imports component/quickjs."
+
+      - name: Inspect Winpthreads archives, try static link variants, and isolate-run QuickJS
+        run: |
+          set -euo pipefail
+          bash .github/scripts/quickjs-smoke/windows-static-link.sh 2>&1 \
+            | tee artifacts/m61d-static/windows-amd64/static-link-experiment.log
+
+      - name: Upload Windows experiment logs and binaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: m61d-static-windows-amd64-${{ github.run_id }}
+          path: artifacts/m61d-static/windows-amd64/
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux-musl-static:
+    name: QuickJS Linux musl static experiment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: "1"
+      CC: musl-gcc
+      GOOS: linux
+      GOARCH: amd64
+      GOTOOLCHAIN: local
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go 1.26.10
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: "1.26.10"
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          cache: false
+
+      - name: Download and install pinned Ubuntu musl packages
+        run: |
+          set -euo pipefail
+          artifact_dir="artifacts/m61d-static/linux-amd64"
+          mkdir -p "$artifact_dir/toolchain-packages"
+          sudo apt-get update
+          sudo apt-get install -y --download-only --no-install-recommends --allow-downgrades \
+            musl=1.2.4-2 musl-dev=1.2.4-2 musl-tools=1.2.4-2
+          for package in \
+            musl_1.2.4-2_amd64.deb \
+            musl-dev_1.2.4-2_amd64.deb \
+            musl-tools_1.2.4-2_amd64.deb; do
+            cp "/var/cache/apt/archives/$package" "$artifact_dir/toolchain-packages/$package"
+          done
+          sha256sum "$artifact_dir"/toolchain-packages/*.deb \
+            | tee "$artifact_dir/toolchain-packages.sha256"
+          sudo apt-get install -y --no-install-recommends --allow-downgrades \
+            musl=1.2.4-2 musl-dev=1.2.4-2 musl-tools=1.2.4-2
+          {
+            cat /etc/os-release
+            grep -hE '^(URIs|Suites|Components):' /etc/apt/sources.list.d/ubuntu.sources || true
+            apt-cache policy musl musl-dev musl-tools
+            dpkg-query -W -f='${binary:Package} ${Version}\n' musl musl-dev musl-tools
+            musl-gcc --version
+            musl-gcc -v
+            musl_gcc_libc="$(musl-gcc -print-file-name=libc.a)"
+            echo "musl_gcc_libc=$musl_gcc_libc"
+            test -f "$musl_gcc_libc"
+            file "$musl_gcc_libc"
+            gcc --version | head -n 1
+            ld --version | head -n 1
+          } 2>&1 | tee "$artifact_dir/toolchain.log"
+
+      - name: Run statically linked QuickJS package tests
+        run: |
+          set -euo pipefail
+          artifact_dir="artifacts/m61d-static/linux-amd64"
+          static_ldflags='-linkmode external -extldflags "-static"'
+          test_bin="$artifact_dir/quickjs-package.test"
+          go test -x -c -tags quickjs -timeout=3m -ldflags="$static_ldflags" \
+            -o "$test_bin" ./component/quickjs 2>&1 \
+            | tee "$artifact_dir/quickjs-package-build.log"
+          "$test_bin" -test.v -test.count=1 -test.timeout=3m 2>&1 \
+            | tee "$artifact_dir/quickjs-package-tests.log"
+
+      - name: Build and run the static QuickJS DNS, TCP, and TLS smoke
+        run: |
+          set -euo pipefail
+          artifact_dir="artifacts/m61d-static/linux-amd64"
+          static_ldflags='-linkmode external -extldflags "-static"'
+          smoke_bin="$artifact_dir/quickjs-smoke"
+          go build -x -tags quickjs -ldflags="$static_ldflags" -o "$smoke_bin" \
+            ./.github/scripts/quickjs-smoke 2>&1 \
+            | tee "$artifact_dir/quickjs-smoke-build.log"
+          GODEBUG=netdns=go+1 "$smoke_bin" --network 2>&1 \
+            | tee "$artifact_dir/quickjs-smoke-go-resolver.log"
+          GODEBUG=netdns=cgo+1 "$smoke_bin" --network 2>&1 \
+            | tee "$artifact_dir/quickjs-smoke-cgo-resolver.log"
+
+      - name: Build the complete current mitmhomo main program statically
+        run: |
+          set -euo pipefail
+          artifact_dir="artifacts/m61d-static/linux-amd64"
+          static_ldflags='-linkmode external -extldflags "-static"'
+          main_bin="$artifact_dir/mihomo-static"
+          go build -x -tags quickjs -ldflags="$static_ldflags" -o "$main_bin" . 2>&1 \
+            | tee "$artifact_dir/quickjs-main-build.log"
+          "$main_bin" -v 2>&1 | tee "$artifact_dir/quickjs-main-smoke.log"
+          echo "NOTE: this build step does not imply the main package imports component/quickjs."
+
+      - name: Check ELF structure for all static outputs
+        run: |
+          set -euo pipefail
+          bash .github/scripts/quickjs-smoke/verify-static-elf.sh \
+            artifacts/m61d-static/linux-amd64/quickjs-package.test \
+            artifacts/m61d-static/linux-amd64/quickjs-smoke \
+            artifacts/m61d-static/linux-amd64/mihomo-static \
+            2>&1 | tee artifacts/m61d-static/linux-amd64/static-elf-check.log
+
+      - name: Upload Linux musl experiment logs and binaries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: m61d-static-linux-amd64-${{ github.run_id }}
+          path: artifacts/m61d-static/linux-amd64/
+          if-no-files-found: warn
+          retention-days: 14
