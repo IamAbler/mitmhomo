@@ -315,7 +315,10 @@ func cloneResponsePatch(lease *CopyLease, patch ResponsePatch, maxBodyBytes int6
 	if patch.Status.Present && (patch.Status.Value < 200 || patch.Status.Value > 599) {
 		return ResponsePatch{}, ErrInvalid
 	}
-	if patch.Status.Present && noBodyStatus(patch.Status.Value) && patch.Body.Kind == BodyReplace && len(patch.Body.Bytes) != 0 {
+	if patch.Status.Present && (patch.Status.Value == 204 || patch.Status.Value == 205) && patch.Body.Kind == BodyReplace && len(patch.Body.Bytes) != 0 {
+		return ResponsePatch{}, ErrInvalid
+	}
+	if patch.Status.Present && patch.Status.Value == 206 && patch.Body.Kind == BodyReplace {
 		return ResponsePatch{}, ErrInvalid
 	}
 	if len(patch.Trailers) != 0 && patch.Body.Kind != BodyReplace {
@@ -549,7 +552,7 @@ func (r DoneResult) ValidateForInput(input Input) error {
 	}
 	if r.Kind() == ResultRespond {
 		p := r.payload.synthetic
-		if noBodyStatus(p.status) && len(p.body) != 0 || strings.EqualFold(input.Request().Method, "HEAD") && len(p.body) != 0 {
+		if noBodyStatus(p.status) && len(p.body) != 0 {
 			return ErrInvalid
 		}
 	}
@@ -565,10 +568,10 @@ func (r DoneResult) ValidateForInput(input Input) error {
 		if r.payload.response.Status.Present {
 			status = r.payload.response.Status.Value
 		}
-		if noBodyStatus(status) && r.payload.response.Body.Kind == BodyReplace && len(r.payload.response.Body.Bytes) != 0 {
+		if (status == 204 || status == 205) && r.payload.response.Body.Kind == BodyReplace && len(r.payload.response.Body.Bytes) != 0 {
 			return ErrInvalid
 		}
-		if strings.EqualFold(input.Request().Method, "HEAD") && r.payload.response.Body.Kind == BodyReplace && len(r.payload.response.Body.Bytes) != 0 {
+		if status == 206 && r.payload.response.Body.Kind == BodyReplace {
 			return ErrInvalid
 		}
 	}

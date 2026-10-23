@@ -120,6 +120,92 @@ func TestTransactionSnapshotIsolationAndRevision(t *testing.T) {
 	}
 }
 
+type trailerBodyReader struct {
+	*strings.Reader
+	completed *bool
+}
+
+func (r *trailerBodyReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF {
+		*r.completed = true
+	}
+	return n, err
+}
+
+func TestTransactionSnapshotPublishesAdapterTrailersAfterBodyEOF(t *testing.T) {
+	ledger := testLedger(t, -1)
+	completed := false
+	broker, err := NewBodyBroker(context.Background(), BodySource{
+		Reader: io.NopCloser(&trailerBodyReader{Reader: strings.NewReader("body"), completed: &completed}),
+		Owner:  TransportOwned, DeclaredLength: 4,
+		SnapshotTrailers: func(lease *CopyLease) (TrailerView, error) {
+			if !completed {
+				return TrailerView{}, ErrInvalid
+			}
+			declared, err := NewHeaderBlock(lease, []HeaderField{{Name: "X-Checksum"}})
+			if err != nil {
+				return TrailerView{}, err
+			}
+			values, err := NewHeaderBlock(lease, []HeaderField{{Name: "X-Checksum", Values: []string{"done"}}})
+			if err != nil {
+				return TrailerView{}, err
+			}
+			return NewTrailerView(TrailerComplete, declared, values)
+		},
+	}, ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputLease := NewCopyLease(ledger)
+	head := testHead(t, inputLease, "POST", "https://example.test/trailers")
+	declared, err := NewHeaderBlock(inputLease, []HeaderField{{Name: "X-Checksum"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head.Trailers, err = NewTrailerView(TrailerPending, declared, HeaderBlock{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := NewTransaction(context.Background(), TransactionOptions{
+		ID: "trailer-tx", Generation: 1, Connection: ConnectionView{ID: "trailer-conn"},
+		OriginalIngress: head, Request: head, RequestBody: NewBodySlot(broker), Ledger: ledger,
+	})
+	inputLease.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+
+	before, beforeLease, err := tx.Snapshot("before-eof")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Request().Trailers.Availability() != TrailerPending {
+		t.Fatal("trailers became complete before Body EOF")
+	}
+	beforeLease.Close()
+	if err := tx.PrepareBody(FullBuffered, 16); err != nil {
+		t.Fatal(err)
+	}
+	after, afterLease, err := tx.Snapshot("after-eof")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer afterLease.Close()
+	if after.Request().Trailers.Availability() != TrailerComplete {
+		t.Fatal("complete Body did not publish adapter trailers")
+	}
+	values, err := after.Request().Trailers.Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, exists, err := values.Values("x-checksum")
+	if err != nil || !exists || len(got) != 1 || got[0] != "done" {
+		t.Fatalf("trailer snapshot = %v, %v, %v", got, exists, err)
+	}
+}
+
 func TestTransactionResponseEntryAndFailureRollback(t *testing.T) {
 	l := testLedger(t, -1)
 	tx, sourceLease := testTransaction(t, context.Background(), l, BodySlot{})

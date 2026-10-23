@@ -692,6 +692,18 @@ func (t *Transaction) Snapshot(invocation InvocationID) (Input, *CopyLease, erro
 		if err != nil {
 			return Input{}, nil, err
 		}
+		trailers, complete, trailerErr := b.SnapshotTrailers(lease)
+		if trailerErr != nil && !errors.Is(trailerErr, ErrBodyBusy) {
+			return Input{}, nil, trailerErr
+		}
+		if complete {
+			if t.phase == RequestPhase {
+				out.request.Trailers = trailers
+			} else {
+				out.response.Trailers = trailers
+				out.phaseResponse.Trailers = trailers
+			}
+		}
 	}
 	failed = false
 	t.currentInvocation = invocation

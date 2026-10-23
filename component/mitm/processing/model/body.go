@@ -38,6 +38,10 @@ type BodySource struct {
 	Reader         io.ReadCloser
 	Owner          OwnerKind
 	DeclaredLength int64 // -1 unknown; otherwise checked at EOF and on excess.
+	// SnapshotTrailers captures adapter-owned trailer values after the source
+	// reaches EOF. It receives the caller's bounded copy lease and must not
+	// perform I/O. A nil callback leaves trailers Pending.
+	SnapshotTrailers func(*CopyLease) (TrailerView, error)
 	// Interrupt must be concurrency-safe, nonblocking, and specific to this source.
 	// It is an explicit adapter capability, never inferred from io.Closer.
 	Interrupt func()
@@ -103,6 +107,7 @@ type BodyBroker struct {
 	held             []io.Closer
 	interrupt        func()
 	acquireExecution func() (io.Closer, error)
+	snapshotTrailers func(*CopyLease) (TrailerView, error)
 }
 
 func NewBodyBroker(ctx context.Context, source BodySource, ledger *Ledger) (*BodyBroker, error) {
@@ -115,7 +120,7 @@ func NewBodyBroker(ctx context.Context, source BodySource, ledger *Ledger) (*Bod
 	if source.Reader == nil && source.DeclaredLength > 0 {
 		return nil, ErrInvalid
 	}
-	b := &BodyBroker{ctx: ctx, ownerContext: ctx, ledger: ledger, closed: make(chan struct{}), interrupt: source.Interrupt, acquireExecution: source.AcquireExecution}
+	b := &BodyBroker{ctx: ctx, ownerContext: ctx, ledger: ledger, closed: make(chan struct{}), interrupt: source.Interrupt, acquireExecution: source.AcquireExecution, snapshotTrailers: source.SnapshotTrailers}
 	b.bodyData = bodyData{ctx: ctx, ledger: ledger, source: source.Reader, owner: source.Owner, declared: source.DeclaredLength, state: UnreadStream}
 	if source.Reader == nil {
 		b.state = Unavailable
@@ -251,6 +256,35 @@ func (b *BodyBroker) Snapshot(lease *CopyLease) (BodyView, error) {
 		return BodyView{}, ErrBodyBusy
 	}
 	return b.bodyData.snapshot(lease)
+}
+
+// SnapshotTrailers returns complete adapter-owned trailers only after the
+// source reached EOF. It never reads the source or exposes the adapter map.
+func (b *BodyBroker) SnapshotTrailers(lease *CopyLease) (TrailerView, bool, error) {
+	if b == nil || lease == nil {
+		return TrailerView{}, false, ErrInvalid
+	}
+	b.mu.Lock()
+	if b.closing {
+		b.mu.Unlock()
+		return TrailerView{}, false, ErrReleased
+	}
+	data := &b.bodyData
+	if op := b.operation; op != nil && op.stream {
+		if op.reading {
+			b.mu.Unlock()
+			return TrailerView{}, false, ErrBodyBusy
+		}
+		data = &op.work
+	}
+	if data.state == Replaced || data.state == Released || data.state == Faulted || !data.eof || b.snapshotTrailers == nil {
+		b.mu.Unlock()
+		return TrailerView{}, false, nil
+	}
+	snapshot := b.snapshotTrailers
+	b.mu.Unlock()
+	trailers, err := snapshot(lease)
+	return trailers, err == nil, err
 }
 
 // BodyView is a detached value. Streaming/prefix views contain no source and

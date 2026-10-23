@@ -90,6 +90,105 @@ func TestDoneResultKindsAndPhaseMatrix(t *testing.T) {
 	}
 }
 
+func TestResponseRepresentationBodiesAreValidForHEADAnd304(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		status int
+		valid  bool
+	}{
+		{name: "head", method: "HEAD", status: 200, valid: true},
+		{name: "not-modified", method: "GET", status: 304, valid: true},
+		{name: "no-content", method: "GET", status: 204},
+		{name: "reset-content", method: "GET", status: 205},
+		{name: "partial-content", method: "GET", status: 206},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ledger := testLedger(t, -1)
+			lease := NewCopyLease(ledger)
+			request := testHead(t, lease, test.method, "https://example.test/resource")
+			responseHeaders, err := NewHeaderBlock(lease, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := ResponseHead{Status: test.status, Headers: responseHeaders}
+			broker, err := NewBodyBroker(context.Background(), BodySource{Owner: TransportOwned, DeclaredLength: -1}, ledger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := NewTransaction(context.Background(), TransactionOptions{
+				ID: "representation-tx", Generation: 1, Connection: ConnectionView{ID: "representation-conn"},
+				OriginalIngress: request, Request: request, Ledger: ledger,
+			})
+			if err != nil {
+				lease.Close()
+				t.Fatal(err)
+			}
+			defer tx.Close()
+			if err := tx.EnterResponse(tx.Revision(), response, response, NewBodySlot(broker), OriginUpstream); err != nil {
+				t.Fatal(err)
+			}
+			input, inputLease, err := tx.Snapshot("response")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer inputLease.Close()
+			result, err := ChangeResponse(ResponsePatch{Body: BodyEdit{Kind: BodyReplace, Bytes: []byte("representation")}}, ledger, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = result.ValidateForInput(input)
+			_ = result.Release()
+			lease.Close()
+			if test.valid && err != nil {
+				t.Fatalf("representation replacement rejected: %v", err)
+			}
+			if !test.valid && err == nil {
+				t.Fatal("invalid body framing was accepted")
+			}
+		})
+	}
+}
+
+func TestSyntheticResponseBodyIsValidForHEADRepresentation(t *testing.T) {
+	ledger, lease := resultFixture(t, -1)
+	defer lease.Close()
+	request := testHead(t, lease, "HEAD", "https://example.test/resource")
+	responseHeaders, err := NewHeaderBlock(lease, []HeaderField{{Name: "Content-Type", Values: []string{"text/plain"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := NewTransaction(context.Background(), TransactionOptions{
+		ID: "head-synthetic", Generation: 1, Connection: ConnectionView{ID: "head-connection"},
+		OriginalIngress: request, Request: request, Ledger: ledger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+	input, inputLease, err := tx.Snapshot("synthetic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inputLease.Close()
+	trailers, err := NewTrailerView(TrailerUnavailable, HeaderBlock{}, HeaderBlock{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	synthetic, err := NewSyntheticResponse(200, responseHeaders, []byte("representation"), trailers, ledger, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Respond(synthetic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.ValidateForInput(input); err != nil {
+		t.Fatalf("HEAD representation body rejected: %v", err)
+	}
+	_ = result.Release()
+}
+
 func TestRequestPatchCopiesInputsAndPreservesURLAndHeaderSemantics(t *testing.T) {
 	ledger, sourceLease := resultFixture(t, -1)
 	defer sourceLease.Close()
@@ -344,10 +443,9 @@ func TestDoneResultStageAndHTTPBasicValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := headResult.ValidateForInput(headInput); err == nil {
-		t.Fatal("HEAD synthetic response body accepted")
+	if err := headResult.ValidateForInput(headInput); err != nil {
+		t.Fatalf("HEAD representation response body rejected: %v", err)
 	}
-	_ = headResult.Release()
 	if err := headResult.Release(); err != nil {
 		t.Fatal(err)
 	}
