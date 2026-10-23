@@ -2,6 +2,7 @@ package jsruntime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -127,6 +128,61 @@ func TestResourceLimitsAndConversionErrors(t *testing.T) {
 	}
 	if _, err := r.Run(context.Background(), `(function () {})`, nil); !errors.Is(err, ErrOutputConversion) {
 		t.Fatalf("non-JSON result error = %v, want ErrOutputConversion", err)
+	}
+}
+
+func TestRunCompiledInputDistinguishesInputBudgetFromOutputLimits(t *testing.T) {
+	runtime := newTestRuntime(t, testConfig())
+	input := map[string]any{"value": "long"}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exactConfig := testConfig()
+	exactConfig.MaxInputBytes = len(encoded)
+	exactRuntime := newTestRuntime(t, exactConfig)
+	exactProgram, err := exactRuntime.Compile("input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exactRuntime.RunCompiledInput(context.Background(), exactProgram, input); err != nil {
+		t.Fatalf("RunCompiledInput rejected input at its exact encoded size: %v", err)
+	}
+
+	limitedConfig := testConfig()
+	limitedConfig.MaxInputBytes = len(encoded) - 1
+	limitedRuntime := newTestRuntime(t, limitedConfig)
+	limitedProgram, err := limitedRuntime.Compile("input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = limitedRuntime.RunCompiledInput(context.Background(), limitedProgram, input)
+	var inputErr *RuntimeError
+	if !errors.As(err, &inputErr) || inputErr.Kind != KindInputResourceLimit || !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("RunCompiledInput error = %v, want input resource limit", err)
+	}
+
+	_, err = limitedRuntime.RunCompiled(context.Background(), limitedProgram, input)
+	var genericErr *RuntimeError
+	if !errors.As(err, &genericErr) || genericErr.Kind != KindResourceLimit {
+		t.Fatalf("RunCompiled error = %v, want existing generic resource limit", err)
+	}
+
+	depthRuntime := runtime
+	depthProgram, err := depthRuntime.Compile("input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deep any = 0
+	for index := 0; index < maxJSONDepth+1; index++ {
+		deep = []any{deep}
+	}
+	_, err = depthRuntime.RunCompiledInput(context.Background(), depthProgram, deep)
+	var depthErr *RuntimeError
+	if !errors.As(err, &depthErr) || depthErr.Kind != KindInputResourceLimit {
+		t.Fatalf("RunCompiledInput depth error = %v, want input resource limit", err)
 	}
 }
 

@@ -41,6 +41,8 @@ func runtimeError(input model.Input, processorID string, err error) error {
 			return processingFailure(model.ProcessingErrorTimeout, input, processorID, err)
 		case jsruntime.KindCanceled:
 			return processingFailure(model.ProcessingErrorCanceled, input, processorID, err)
+		case jsruntime.KindInputResourceLimit:
+			return processingFailure(model.ProcessingErrorResourceLimit, input, processorID, err)
 		case jsruntime.KindResourceLimit:
 			return processingFailure(model.ProcessingErrorOutputLimitExceeded, input, processorID, err)
 		case jsruntime.KindInputConversion:

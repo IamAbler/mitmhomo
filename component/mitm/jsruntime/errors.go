@@ -9,15 +9,16 @@ import (
 type ErrorKind string
 
 const (
-	KindCompile          ErrorKind = "compile"
-	KindExecution        ErrorKind = "execution"
-	KindTimeout          ErrorKind = "timeout"
-	KindCanceled         ErrorKind = "canceled"
-	KindResourceLimit    ErrorKind = "resource_limit"
-	KindInputConversion  ErrorKind = "input_conversion"
-	KindOutputConversion ErrorKind = "output_conversion"
-	KindClosed           ErrorKind = "closed"
-	KindInvalidProgram   ErrorKind = "invalid_program"
+	KindCompile            ErrorKind = "compile"
+	KindExecution          ErrorKind = "execution"
+	KindTimeout            ErrorKind = "timeout"
+	KindCanceled           ErrorKind = "canceled"
+	KindResourceLimit      ErrorKind = "resource_limit"
+	KindInputResourceLimit ErrorKind = "input_resource_limit"
+	KindInputConversion    ErrorKind = "input_conversion"
+	KindOutputConversion   ErrorKind = "output_conversion"
+	KindClosed             ErrorKind = "closed"
+	KindInvalidProgram     ErrorKind = "invalid_program"
 )
 
 var (
@@ -73,6 +74,8 @@ func errorSentinel(kind ErrorKind) error {
 	case KindCanceled:
 		return ErrCanceled
 	case KindResourceLimit:
+		return ErrResourceLimit
+	case KindInputResourceLimit:
 		return ErrResourceLimit
 	case KindInputConversion:
 		return ErrInputConversion

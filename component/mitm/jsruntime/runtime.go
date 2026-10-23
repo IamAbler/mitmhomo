@@ -242,7 +242,24 @@ func (r *Runtime) RunCompiled(ctx context.Context, compiled *CompiledScript, inp
 	})
 }
 
+// RunCompiledInput executes a script with a bounded input value in a fresh VM.
+// Input size and depth failures are reported as KindInputResourceLimit so
+// adapters can distinguish input budget exhaustion from script output limits.
+func (r *Runtime) RunCompiledInput(ctx context.Context, compiled *CompiledScript, input any) (any, error) {
+	return guardPanic(KindExecution, func() (any, error) {
+		return r.runCompiledInput(ctx, compiled, input)
+	})
+}
+
 func (r *Runtime) runCompiled(ctx context.Context, compiled *CompiledScript, input any) (any, error) {
+	return r.runCompiledWithInputLimitKind(ctx, compiled, input, KindResourceLimit)
+}
+
+func (r *Runtime) runCompiledInput(ctx context.Context, compiled *CompiledScript, input any) (any, error) {
+	return r.runCompiledWithInputLimitKind(ctx, compiled, input, KindInputResourceLimit)
+}
+
+func (r *Runtime) runCompiledWithInputLimitKind(ctx context.Context, compiled *CompiledScript, input any, inputLimitKind ErrorKind) (any, error) {
 	if r == nil {
 		return nil, newRuntimeError(KindExecution, errors.New("nil runtime"))
 	}
@@ -281,7 +298,7 @@ func (r *Runtime) runCompiled(ctx context.Context, compiled *CompiledScript, inp
 	})
 	if err != nil {
 		if errors.Is(err, ErrResourceLimit) {
-			return nil, newRuntimeError(KindResourceLimit, err)
+			return nil, newRuntimeError(inputLimitKind, err)
 		}
 		return nil, asRuntimeError(KindInputConversion, err)
 	}

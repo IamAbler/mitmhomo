@@ -2,8 +2,10 @@ package gojaprocessor
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/metacubex/mihomo/component/mitm/jsruntime"
@@ -87,19 +89,88 @@ func benchmarkProcessorRun(b *testing.B, source string, body []byte) {
 	b.Helper()
 	backend := newTestProcessor(b, testConfig(source))
 	tx := testTransaction(b, 7, body)
-	input, inputLease, err := tx.Snapshot("benchmark-goja")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer inputLease.Close()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		// Each real Invocation receives a fresh, independently owned snapshot.
+		// Reusing one CopyLease here made the old microbenchmark accumulate
+		// temporary input conversions until the transaction budget failed in
+		// longer profiles.
+		b.StopTimer()
+		input, inputLease, err := tx.Snapshot("benchmark-goja")
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
 		result, err := backend.run(context.Background(), input, backend.program)
 		if err != nil {
 			b.Fatal(err)
 		}
 		_ = result.Release()
+		b.StopTimer()
+		if err := inputLease.Close(); err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+	}
+}
+
+func BenchmarkGojaStartAwaitContinue(b *testing.B) {
+	backend := newTestProcessor(b, testConfig(benchmarkContinueSource))
+	tx := testTransaction(b, 7, nil)
+	var sequence atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		input, lease, err := tx.Snapshot(model.InvocationID("bench-start-" + decimalUint(sequence.Add(1))))
+		if err != nil {
+			b.Fatal(err)
+		}
+		invocation, err := backend.Start(context.Background(), input, lease)
+		if err != nil {
+			_ = lease.Close()
+			b.Fatal(err)
+		}
+		result, err := invocation.Await(context.Background())
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = result.Release()
+		<-invocation.ExecutionDone()
+	}
+}
+
+func BenchmarkGojaContextCancel(b *testing.B) {
+	config := testConfig(`function process(input) { while (true) {} }`)
+	config.ExecutionTimeout = time.Second
+	backend := newTestProcessor(b, config)
+	tx := testTransaction(b, 7, nil)
+	var sequence atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		input, lease, err := tx.Snapshot(model.InvocationID("bench-cancel-" + decimalUint(sequence.Add(1))))
+		if err != nil {
+			cancel()
+			b.Fatal(err)
+		}
+		invocation, err := backend.Start(ctx, input, lease)
+		if err != nil {
+			cancel()
+			_ = lease.Close()
+			b.Fatal(err)
+		}
+		timer := time.AfterFunc(100*time.Microsecond, cancel)
+		_, awaitErr := invocation.Await(context.Background())
+		if !errors.Is(awaitErr, context.Canceled) {
+			cancel()
+			<-invocation.ExecutionDone()
+			b.Fatalf("await error = %v, want context canceled", awaitErr)
+		}
+		cancel()
+		timer.Stop()
+		<-invocation.ExecutionDone()
 	}
 }
 

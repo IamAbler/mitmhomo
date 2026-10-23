@@ -87,6 +87,96 @@ func BenchmarkPipeline3ProcessorNoBody(b *testing.B) {
 	}
 }
 
+func BenchmarkPipelineNoProcessor(b *testing.B) {
+	runner := benchmarkRunner(b, nil)
+	defer func() { _ = runner.Close(); _ = runner.WaitClosed(context.Background()) }()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, _ := benchmarkTransaction(b, fmt.Sprintf("bench-empty-%d", i), "")
+		b.StartTimer()
+		report, err := runner.Run(context.Background(), tx, model.RequestPhase)
+		if err != nil || report.Outcome != ContinueUpstream {
+			b.Fatalf("empty Pipeline report=%+v err=%v", report, err)
+		}
+		b.StopTimer()
+		_ = tx.Close()
+		b.StartTimer()
+	}
+}
+
+func BenchmarkPipelineSingleContinue(b *testing.B) {
+	continueProcessor := newFake(b, "single-continue", processor.Requirements{}, nil)
+	runner := benchmarkRunner(b, []Entry{{Class: Script, Processor: continueProcessor}})
+	defer func() { _ = runner.Close(); _ = runner.WaitClosed(context.Background()) }()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, _ := benchmarkTransaction(b, fmt.Sprintf("bench-continue-%d", i), "")
+		b.StartTimer()
+		if _, err := runner.Run(context.Background(), tx, model.RequestPhase); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		_ = tx.Close()
+		b.StartTimer()
+	}
+}
+
+func BenchmarkPipelinePrefixReplay(b *testing.B) {
+	const bodySize = 64 << 10
+	body := strings.Repeat("p", bodySize)
+	oversize := newFake(b, "prefix-limit", processor.Requirements{Body: model.FullBuffered, MaxBodyBytes: 1024}, nil)
+	observer := newFake(b, "prefix-observer", processor.Requirements{}, nil)
+	runner := benchmarkRunner(b, []Entry{
+		{Class: Script, Processor: oversize, AllowFailOpen: true, FailOpenSafe: func(error) bool { return true }},
+		{Class: Rewrite, Processor: observer},
+	})
+	defer func() { _ = runner.Close(); _ = runner.WaitClosed(context.Background()) }()
+	b.ReportAllocs()
+	b.SetBytes(bodySize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, _ := benchmarkTransaction(b, fmt.Sprintf("bench-prefix-%d", i), body)
+		b.StartTimer()
+		report, err := runner.Run(context.Background(), tx, model.RequestPhase)
+		if err != nil || len(report.Recoveries) != 1 {
+			b.Fatalf("PrefixReplay fallback report=%+v err=%v", report, err)
+		}
+		if info := tx.BodyInfo(model.RequestPhase); info.State != model.PrefixReplay {
+			b.Fatalf("body state = %v, want PrefixReplay", info.State)
+		}
+		b.StopTimer()
+		stream, err := tx.TakeBody()
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.Copy(io.Discard, stream); err != nil {
+			b.Fatal(err)
+		}
+		_ = stream.Close()
+		_ = tx.Close()
+		b.StartTimer()
+	}
+}
+
+func BenchmarkPipelineBodyLogicalClose(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tx, _ := benchmarkTransaction(b, fmt.Sprintf("bench-logical-close-%d", i), "payload")
+		b.StartTimer()
+		tx.CloseBodyLogical(model.RequestPhase)
+		b.StopTimer()
+		_ = tx.Close()
+		b.StartTimer()
+	}
+}
+
 func BenchmarkPipelineRequestChangeContinue(b *testing.B) {
 	var ledger *model.Ledger
 	change := newFake(b, "request-change", processor.Requirements{}, func(_ *processor.Invocation, completion *processor.Completion, _ model.Input) {

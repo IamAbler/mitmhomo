@@ -209,6 +209,23 @@ func TestGojaResultsExecuteThroughFrameworkPipeline(t *testing.T) {
 	}
 }
 
+func TestGojaInputBudgetFailureRemainsResourceLimit(t *testing.T) {
+	config := testConfig(`function process(input) { return {kind:"continue"}; }`)
+	config.MaxInputBytes = 32
+	backend := newTestProcessor(t, config)
+	tx := testTransaction(t, 7, nil)
+	input, lease, err := tx.Snapshot("input-budget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	_, err = backend.run(context.Background(), input, backend.program)
+	if !processingKindIs(err, model.ProcessingErrorResourceLimit) {
+		t.Fatalf("Goja input budget error = %v, want ProcessingErrorResourceLimit", err)
+	}
+}
+
 func TestGojaResponseChangeThroughPipeline(t *testing.T) {
 	config := Config{ID: "response-js", Source: `function process(input) { if (input.phase !== "response" || input.response.status !== 200) throw new Error("bad response input"); return {kind:"response_change",response:{status:202,headers:[{op:"set",name:"X-Response",values:["changed"]}],body:{encoding:"base64",data:"AQI="}}}; }`, Response: true}
 	backend := newTestProcessor(t, config)

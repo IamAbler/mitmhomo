@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -745,9 +746,18 @@ func TestM52GojaInvocationCapacityMapsToServiceUnavailable(t *testing.T) {
 	}
 }
 
-func benchmarkM52MITMOffClient(b *testing.B, h2 bool) (*http.Client, func()) {
+func benchmarkM52MITMOffClient(b *testing.B, h2 bool) (*http.Client, *atomic.Int32, func()) {
 	b.Helper()
-	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }))
+	originConnections := &atomic.Int32{}
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		_, _ = io.Copy(io.Discard, request.Body)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	origin.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			originConnections.Add(1)
+		}
+	}
 	origin.EnableHTTP2 = h2
 	origin.StartTLS()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -813,7 +823,7 @@ func benchmarkM52MITMOffClient(b *testing.B, h2 bool) (*http.Client, func()) {
 		relays.Wait()
 		origin.Close()
 	}
-	return client, cleanup
+	return client, originConnections, cleanup
 }
 
 func BenchmarkM52ProductionHTTPProtocolPaths(b *testing.B) {
@@ -826,11 +836,12 @@ func BenchmarkM52ProductionHTTPProtocolPaths(b *testing.B) {
 				b.Run(mode, func(b *testing.B) {
 					var client *http.Client
 					var harness *h2Harness
+					var originConnections *atomic.Int32
 					var cleanup func()
 					target := "https://localhost/benchmark"
 					switch mode {
 					case "mitm-off-native-relay":
-						client, cleanup = benchmarkM52MITMOffClient(b, protocol.h2)
+						client, originConnections, cleanup = benchmarkM52MITMOffClient(b, protocol.h2)
 						target = "https://example.com/benchmark"
 					case "mitm-on-no-processor":
 						harness = m52ProtocolHarness(b, protocol.h2, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }), nil)
@@ -861,6 +872,12 @@ func BenchmarkM52ProductionHTTPProtocolPaths(b *testing.B) {
 					}
 					_, _ = io.Copy(io.Discard, response.Body)
 					_ = response.Body.Close()
+					connectionsAtWarmup := int32(0)
+					if originConnections != nil {
+						connectionsAtWarmup = originConnections.Load()
+					} else if harness != nil {
+						connectionsAtWarmup = harness.accepted.Load()
+					}
 					b.ReportAllocs()
 					b.ResetTimer()
 					for index := 0; index < b.N; index++ {
@@ -876,6 +893,160 @@ func BenchmarkM52ProductionHTTPProtocolPaths(b *testing.B) {
 						if err := response.Body.Close(); err != nil {
 							b.Fatal(err)
 						}
+					}
+					if b.N > 0 {
+						connectionsAfter := int32(0)
+						if originConnections != nil {
+							connectionsAfter = originConnections.Load()
+						} else if harness != nil {
+							connectionsAfter = harness.accepted.Load()
+						}
+						b.ReportMetric(float64(connectionsAfter-connectionsAtWarmup)/float64(b.N), "origin-conns/op")
+					}
+				})
+			}
+		})
+	}
+}
+
+func BenchmarkM53ProductionHTTPBodySizes(b *testing.B) {
+	protocols := []struct {
+		name string
+		h2   bool
+	}{{name: "http11"}, {name: "http2", h2: true}}
+	modes := []string{"mitm-off", "mitm-on-no-processor", "goja-continue", "goja-header", "goja-request-body", "goja-response-body"}
+	sizes := []struct {
+		name string
+		n    int
+	}{{name: "small-128b", n: 128}, {name: "medium-64k", n: 64 << 10}, {name: "near-budget", n: (1 << 20) - (16 << 10)}}
+	for _, protocol := range protocols {
+		b.Run(protocol.name, func(b *testing.B) {
+			for _, mode := range modes {
+				b.Run(mode, func(b *testing.B) {
+					for _, size := range sizes {
+						b.Run(size.name, func(b *testing.B) {
+							payload := strings.Repeat("x", size.n)
+							var upstreamRead atomic.Int64
+							var upstreamReadErr atomic.Value
+							echo := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+								read, err := io.Copy(io.Discard, request.Body)
+								upstreamRead.Store(read)
+								if err != nil {
+									upstreamReadErr.Store(err.Error())
+									return
+								}
+								w.Header().Set("Content-Length", fmt.Sprint(len(payload)))
+								_, _ = io.WriteString(w, payload)
+							})
+							target := "https://localhost/benchmark-body"
+							var client *http.Client
+							var harness *h2Harness
+							var originConnections *atomic.Int32
+							var cleanup func()
+							switch mode {
+							case "mitm-off":
+								client, originConnections, cleanup = benchmarkM52MITMOffClient(b, protocol.h2)
+								target = "https://example.com/benchmark-body"
+							case "mitm-on-no-processor":
+								harness = m52ProtocolHarness(b, protocol.h2, echo, nil)
+								client = &http.Client{Transport: harness.wire}
+							case "goja-continue":
+								factory := m52GojaFactory(b, gojaprocessor.Config{
+									ID: "m53-body-continue", Source: `function process(input) { return {kind:"continue"}; }`, Request: true, Response: true,
+								})
+								harness = m52ProtocolHarness(b, protocol.h2, echo, factory)
+								client = &http.Client{Transport: harness.wire}
+							case "goja-header":
+								factory := m52GojaFactory(b, gojaprocessor.Config{
+									ID: "m53-body-header", Source: `function process(input) { if (input.phase === "request") return {kind:"request_change",request:{headers:[{op:"set",name:"X-M53-Benchmark",values:["header"]}]}}; return {kind:"continue"}; }`, Request: true,
+								})
+								harness = m52ProtocolHarness(b, protocol.h2, echo, factory)
+								client = &http.Client{Transport: harness.wire}
+							case "goja-request-body":
+								factory := m52GojaFactory(b, gojaprocessor.Config{
+									ID: "m53-request-body", Source: `function process(input) { if (input.phase !== "request") return {kind:"continue"}; if (!input.body.available) throw new Error("body unavailable"); return {kind:"request_change",request:{body:{encoding:"base64",data:input.body.base64}}}; }`, Request: true,
+									RequestBody: model.FullBuffered, RequestMaxBodyBytes: 1 << 20,
+								})
+								harness = m52ProtocolHarness(b, protocol.h2, echo, factory)
+								client = &http.Client{Transport: harness.wire}
+							case "goja-response-body":
+								factory := m52GojaFactory(b, gojaprocessor.Config{
+									ID: "m53-response-body", Source: `function process(input) { if (input.phase !== "response") return {kind:"continue"}; if (!input.body.available) throw new Error("body unavailable"); return {kind:"response_change",response:{body:{encoding:"base64",data:input.body.base64}}}; }`, Response: true,
+									ResponseBody: model.FullBuffered, ResponseMaxBodyBytes: 1 << 20,
+								})
+								harness = m52ProtocolHarness(b, protocol.h2, echo, factory)
+								client = &http.Client{Transport: harness.wire}
+							}
+							if cleanup != nil {
+								defer func() { b.StopTimer(); cleanup() }()
+							}
+							send := func() (*http.Response, error) {
+								request, err := http.NewRequest(http.MethodPost, target, strings.NewReader(payload))
+								if err != nil {
+									return nil, err
+								}
+								if harness != nil {
+									return harness.wire.RoundTrip(request)
+								}
+								return client.Do(request)
+							}
+							consume := func(response *http.Response) error {
+								if want := map[bool]int{false: 1, true: 2}[protocol.h2]; response.ProtoMajor != want {
+									return errors.New("benchmark negotiated an unexpected downstream protocol")
+								}
+								n, err := io.Copy(io.Discard, response.Body)
+								closeErr := response.Body.Close()
+								if err != nil {
+									return fmt.Errorf("response copy after %d bytes (content-length=%d, upstream-read=%d, upstream-read-error=%v): %w", n, response.ContentLength, upstreamRead.Load(), upstreamReadErr.Load(), err)
+								}
+								if closeErr != nil {
+									return closeErr
+								}
+								wantLength := len(payload)
+								if mode == "mitm-off" {
+									wantLength = len("ok")
+								}
+								if n != int64(wantLength) {
+									return fmt.Errorf("benchmark response length = %d, want %d (status=%d, content-length=%d, upstream-read=%d)", n, wantLength, response.StatusCode, response.ContentLength, upstreamRead.Load())
+								}
+								if harness != nil && upstreamRead.Load() != int64(size.n) {
+									return fmt.Errorf("upstream read %d request bytes, want %d", upstreamRead.Load(), size.n)
+								}
+								return nil
+							}
+							response, err := send()
+							if err != nil {
+								b.Fatal(err)
+							}
+							if err := consume(response); err != nil {
+								b.Fatal(err)
+							}
+							connectionsAtWarmup := int32(0)
+							if harness != nil {
+								connectionsAtWarmup = harness.accepted.Load()
+							} else if originConnections != nil {
+								connectionsAtWarmup = originConnections.Load()
+							}
+							b.ReportAllocs()
+							b.ReportMetric(float64(size.n), "body-bytes/op")
+							b.ResetTimer()
+							for index := 0; index < b.N; index++ {
+								response, err := send()
+								if err != nil {
+									b.Fatal(err)
+								}
+								if err := consume(response); err != nil {
+									b.Fatal(err)
+								}
+							}
+							if harness != nil && b.N > 0 {
+								newConnections := harness.accepted.Load() - connectionsAtWarmup
+								b.ReportMetric(float64(newConnections)/float64(b.N), "origin-conns/op")
+							} else if originConnections != nil && b.N > 0 {
+								newConnections := originConnections.Load() - connectionsAtWarmup
+								b.ReportMetric(float64(newConnections)/float64(b.N), "origin-conns/op")
+							}
+						})
 					}
 				})
 			}

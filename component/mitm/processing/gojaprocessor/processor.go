@@ -333,13 +333,7 @@ func (p *Processor) run(ctx context.Context, input model.Input, program *jsrunti
 	if err != nil {
 		return model.DoneResult{}, inputError(input, p.descriptor.ID, err)
 	}
-	if size, sizeErr := boundedJSONSize(jsInput, p.config.MaxInputBytes); sizeErr != nil || size > p.config.MaxInputBytes {
-		if sizeErr == nil {
-			sizeErr = fmt.Errorf("serialized JavaScript input exceeds %d bytes", p.config.MaxInputBytes)
-		}
-		return model.DoneResult{}, processingFailure(model.ProcessingErrorResourceLimit, input, p.descriptor.ID, sizeErr)
-	}
-	output, err := p.runtime.RunCompiled(ctx, program, jsInput)
+	output, err := p.runtime.RunCompiledInput(ctx, program, jsInput)
 	if err != nil {
 		return model.DoneResult{}, runtimeError(input, p.descriptor.ID, err)
 	}
