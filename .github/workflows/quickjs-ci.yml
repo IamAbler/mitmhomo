@@ -87,7 +87,7 @@ jobs:
               target="$(gcc -dumpmachine)"
               [[ "$target" == x86_64-w64-mingw32* ]]
               test "$GOOS" = "windows"
-              grep -n '#cgo windows LDFLAGS:' component/quickjs/quickjs_cgo.go || true
+              grep -n '#cgo windows LDFLAGS:' component/quickjs/quickjs_cgo.go
               for runtime_file in \
                 libwinpthread-1.dll libpthread.a libwinpthread.a libwinpthread.dll.a; do
                 resolved="$(gcc -print-file-name="$runtime_file" | tr -d '\r')"
@@ -98,7 +98,11 @@ jobs:
                   printf 'gcc_file_exists[%s]=no\n' "$runtime_file"
                 fi
               done
-              where.exe libwinpthread-1.dll || true
+              if where.exe libwinpthread-1.dll; then
+                :
+              else
+                echo "libwinpthread-1.dll is not present on PATH; GCC's resolved runtime path is recorded above"
+              fi
             elif [[ "$RUNNER_OS" == "Linux" ]]; then
               target="$(gcc -dumpmachine)"
               [[ "$target" == x86_64-linux-gnu* ]]
@@ -108,6 +112,13 @@ jobs:
               exit 1
             fi
           } 2>&1 | tee artifacts/quickjs-ci/toolchain.log
+
+      - name: Test strict Windows PE import checker
+        if: ${{ always() && !cancelled() && steps.go_setup.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          GO111MODULE=off go test -v ./.github/scripts/pecheck 2>&1 \
+            | tee artifacts/quickjs-ci/pecheck-tests.log
 
       - name: Build QuickJS package test executable
         run: |
@@ -148,136 +159,279 @@ jobs:
             local stem="$2"
             local arch_log="artifacts/quickjs-ci/${stem}-pe-architecture.log"
             local pe_log="artifacts/quickjs-ci/${stem}-pe-imports.log"
+            local strict_log="artifacts/quickjs-ci/${stem}-strict-pe-check.log"
             local imports_file="artifacts/quickjs-ci/${stem}-dll-imports.txt"
+            local delay_file="artifacts/quickjs-ci/${stem}-delay-dll-imports.txt"
             local runtime_log="artifacts/quickjs-ci/${stem}-dll-classification.log"
-            local gcc_path=""
-            local where_output=""
-            local where_path=""
-            local archive_path=""
+            local objdump_names="artifacts/quickjs-ci/${stem}-objdump-dll-imports.txt"
+            local parsed_names="artifacts/quickjs-ci/${stem}-parsed-dll-imports.txt"
+            local compare_log="artifacts/quickjs-ci/${stem}-objdump-import-crosscheck.log"
+            local failed=0
+            local objdump_ok=1
+            local strict_ok=1
 
             if [[ ! -f "$exe" || ! -s "$exe" ]]; then
               echo "PE input is missing or empty: $exe" >&2
               return 1
             fi
-            if ! command -v objdump >/dev/null 2>&1; then
-              echo "objdump execution failure: executable is not available on PATH" >&2
-              return 1
-            fi
-            if ! objdump --version >/dev/null 2>&1; then
-              echo "objdump execution failure: objdump --version returned non-zero" >&2
-              return 1
-            fi
-            if objdump -f "$exe" > "$arch_log" 2>&1; then
-              cat "$arch_log"
-            else
-              cat "$arch_log" >&2
-              echo "objdump execution failure during PE inspection: objdump -f returned non-zero for $exe; a damaged PE may also cause this" >&2
-              return 1
-            fi
-            if ! grep -Eq 'file format pei-[^[:space:]]+' "$arch_log"; then
-              echo "PE validation failure: objdump ran successfully but did not recognize a PE file format for $exe; the file may be damaged or malformed" >&2
-              return 1
-            fi
-            if ! grep -Fq "file format pei-x86-64" "$arch_log"; then
-              echo "PE architecture mismatch: expected pei-x86-64" >&2
-              return 1
-            fi
-            if ! grep -Fq "architecture: i386:x86-64" "$arch_log"; then
-              echo "PE validation failure: PE format and architecture metadata are inconsistent for $exe" >&2
-              return 1
-            fi
-            if objdump -p "$exe" > "$pe_log" 2>&1; then
-              cat "$pe_log"
-            else
-              cat "$pe_log" >&2
-              echo "DLL import parsing failed: objdump -p returned non-zero for $exe" >&2
-              return 1
-            fi
-            if ! grep -Fq "The Data Directory" "$pe_log" \
-              || ! grep -Eq '^[[:space:]]*Entry[[:space:]]+1[[:space:]].*Import Directory' "$pe_log"; then
-              echo "DLL import parsing failed: objdump output lacks the PE data directory or import-directory entry for $exe" >&2
-              return 1
-            fi
-            if ! sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p' "$pe_log" \
-              | tr '[:upper:]' '[:lower:]' | sort -fu > "$imports_file"; then
-              echo "DLL import parsing failed while extracting DLL Name entries from $pe_log" >&2
+            if ! : > "$compare_log"; then
+              echo "Cannot create PE parser cross-check artifact: $compare_log" >&2
               return 1
             fi
 
-            {
-              echo "Executable: $exe"
-              echo "PE architecture: x86-64"
-              echo "Direct DLL imports:"
-              if [[ -s "$imports_file" ]]; then
-                cat "$imports_file"
+            if command -v objdump >/dev/null 2>&1; then
+              if objdump --version > "$arch_log" 2>&1; then
+                cat "$arch_log"
               else
-                echo "NO_ORDINARY_DIRECT_DLL_IMPORTS (valid PE and import directory parsed; this does not prove static linking)"
+                cat "$arch_log" >&2
+                echo "objdump execution failure: objdump --version returned non-zero" >&2
+                failed=1
               fi
-              while IFS= read -r dll; do
-                case "$dll" in
-                  api-ms-win-*.dll|ext-ms-win-*.dll)
-                    printf 'WINDOWS_API_SET_CONTRACT %s (minimum target OS not validated)\n' "$dll"
-                    ;;
-                  advapi32.dll|bcrypt.dll|cfgmgr32.dll|comdlg32.dll|crypt32.dll|dnsapi.dll|gdi32.dll|iphlpapi.dll|kernel32.dll|kernelbase.dll|msvcrt.dll|netapi32.dll|ntdll.dll|ole32.dll|oleaut32.dll|powrprof.dll|psapi.dll|rpcrt4.dll|secur32.dll|setupapi.dll|shell32.dll|shlwapi.dll|user32.dll|userenv.dll|version.dll|winhttp.dll|wininet.dll|winmm.dll|ws2_32.dll|wtsapi32.dll|ucrtbase.dll)
-                    printf 'WINDOWS_OS_MODULE %s (name classified; compatibility with minimum Windows release not proven by runner presence)\n' "$dll"
-                    ;;
-                  lib*.dll|mingw*.dll|msys-*.dll)
-                    gcc_path="$(gcc -print-file-name="$dll" | tr -d '\r')"
-                    where_output="$(where.exe "$dll" 2>&1 || true)"
-                    where_path="$(printf '%s\n' "$where_output" | sed -n '1p' | tr -d '\r')"
-                    resolved="$gcc_path"
-                    if [[ "$resolved" == "$dll" || ! -f "$resolved" ]]; then
-                      if [[ -n "$where_path" ]] && command -v cygpath >/dev/null 2>&1; then
-                        resolved="$(cygpath -u "$where_path" 2>/dev/null || true)"
+              if objdump -f "$exe" > "$arch_log" 2>&1; then
+                cat "$arch_log"
+                if ! grep -Eq 'file format pei-[^[:space:]]+' "$arch_log"; then
+                  echo "PE format validation failure: objdump did not recognize a PE file: $exe" >&2
+                  failed=1
+                fi
+                if ! grep -Fq "file format pei-x86-64" "$arch_log" \
+                  || ! grep -Fq "architecture: i386:x86-64" "$arch_log"; then
+                  echo "PE architecture mismatch: expected x86-64 AMD64 for $exe" >&2
+                  failed=1
+                fi
+              else
+                cat "$arch_log" >&2
+                echo "objdump execution failure during PE architecture inspection: objdump -f returned non-zero for $exe" >&2
+                failed=1
+              fi
+              if objdump -p "$exe" > "$pe_log" 2>&1; then
+                cat "$pe_log"
+              else
+                cat "$pe_log" >&2
+                echo "objdump execution failure during PE import diagnostics: objdump -p returned non-zero for $exe" >&2
+                objdump_ok=0
+                failed=1
+              fi
+              if [[ "$objdump_ok" == "1" ]]; then
+                if ! grep -Fq "The Data Directory" "$pe_log" \
+                  || ! grep -Eq '^[[:space:]]*Entry[[:space:]]+1[[:space:]].*Import Directory' "$pe_log"; then
+                  echo "objdump output lacks the Import Directory entry for $exe" >&2
+                  objdump_ok=0
+                  failed=1
+                fi
+                if sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p' "$pe_log" \
+                  | tr '[:upper:]' '[:lower:]' | sort -fu > "$objdump_names"; then
+                  :
+                else
+                  echo "objdump DLL Name diagnostic extraction failed for $exe" >&2
+                  objdump_ok=0
+                  failed=1
+                fi
+              fi
+            else
+              echo "objdump execution failure: executable is not available on PATH" >&2
+              objdump_ok=0
+              failed=1
+            fi
+
+            if GO111MODULE=off go run ./.github/scripts/pecheck "$exe" "$imports_file" "$delay_file" > "$strict_log" 2>&1; then
+              cat "$strict_log"
+            else
+              cat "$strict_log" >&2
+              echo "Strict PE import parsing failed for $exe" >&2
+              strict_ok=0
+              failed=1
+            fi
+
+            if [[ "$strict_ok" == "1" && "$objdump_ok" == "1" ]]; then
+              normalize_hex() {
+                local value="${1,,}"
+                value="${value#0x}"
+                value="$(sed -E 's/^0+//; s/^$/0/' <<< "$value")"
+                printf '%s\n' "$value"
+              }
+              compare_directory_entry() {
+                local entry="$1"
+                local label="$2"
+                local objdump_fields=""
+                local strict_fields=""
+                local strict_line=""
+                local objdump_rva=""
+                local objdump_size=""
+                local strict_rva=""
+                local strict_size=""
+                local key="${label// /_}"
+                key="${key^^}"
+                if ! objdump_fields="$(awk -v entry="$entry" 'tolower($1) == "entry" && tolower($2) == tolower(entry) { print $3, $4; found++ } END { if (found != 1) exit 1 }' "$pe_log")"; then
+                  echo "objdump could not uniquely read the $label DataDirectory entry" | tee -a "$compare_log" >&2
+                  return 1
+                fi
+                strict_line="$(sed -n "/^${label} Directory: RVA=/p" "$strict_log")"
+                if [[ -z "$strict_line" ]]; then
+                  echo "bounded parser omitted the $label DataDirectory entry" | tee -a "$compare_log" >&2
+                  return 1
+                fi
+                if ! strict_fields="$(sed -E 's/^.*RVA=(0x[[:xdigit:]]+) Size=(0x[[:xdigit:]]+).*$/\1 \2/' <<< "$strict_line")"; then
+                  echo "could not extract bounded parser $label RVA and Size" | tee -a "$compare_log" >&2
+                  return 1
+                fi
+                read -r objdump_rva objdump_size <<< "$objdump_fields"
+                read -r strict_rva strict_size <<< "$strict_fields"
+                if [[ "$(normalize_hex "$objdump_rva")" != "$(normalize_hex "$strict_rva")" \
+                  || "$(normalize_hex "$objdump_size")" != "$(normalize_hex "$strict_size")" ]]; then
+                  echo "$label DataDirectory disagreement: objdump=RVA $objdump_rva Size $objdump_size; debug/pe=RVA $strict_rva Size $strict_size" | tee -a "$compare_log" >&2
+                  return 1
+                fi
+                echo "OBJDUMP_${key}_DIRECTORY_CROSSCHECK=AGREES RVA=$strict_rva Size=$strict_size" | tee -a "$compare_log"
+              }
+              if ! compare_directory_entry 1 Import; then failed=1; fi
+              if ! compare_directory_entry d Delay\ Import; then failed=1; fi
+
+              parsed_ok=1
+              if cat "$imports_file" "$delay_file" \
+                | tr '[:upper:]' '[:lower:]' | sort -fu > "$parsed_names"; then
+                :
+              else
+                echo "Strict parser DLL list normalization failed for $exe" >&2
+                failed=1
+                parsed_ok=0
+              fi
+              if [[ "$parsed_ok" == "1" ]] && cmp -s "$objdump_names" "$parsed_names"; then
+                echo "OBJDUMP_IMPORT_CROSSCHECK=AGREES" | tee -a "$compare_log"
+              elif [[ "$parsed_ok" == "1" ]]; then
+                {
+                  echo "OBJDUMP_IMPORT_CROSSCHECK=DISAGREES"
+                  echo "objdump DLL names:"
+                  cat "$objdump_names"
+                  echo "bounded parser direct and delay DLL names:"
+                  cat "$parsed_names"
+                } | tee -a "$compare_log"
+                if [[ -s "$parsed_names" && ! -s "$objdump_names" && ! -s "$delay_file" ]] \
+                  && grep -Eq '^There is an import table in \.zdebug_[^[:space:]]+ at ' "$pe_log" \
+                  && grep -Fq 'debug/pe ImportedSymbols cross-check: PASS' "$strict_log" \
+                  && grep -Fq 'Section=".idata"' "$strict_log" \
+                  && grep -Fq 'PE_IMPORT_VALIDATION=PASS' "$strict_log"; then
+                  {
+                    echo "OBJDUMP_IMPORT_DISAGREEMENT=CONFIRMED_GNU_SECTION_LOOKUP_LIMITATION"
+                    echo "Resolution evidence: objdump names a .zdebug_* section, while debug/pe and bounded raw RVA parsing agree on the .idata descriptors, DLL names, and terminated thunk tables."
+                  } | tee -a "$compare_log"
+                else
+                  echo "Unresolved PE import parser disagreement for $exe" >&2
+                  failed=1
+                fi
+                if diff -u "$objdump_names" "$parsed_names" > "${compare_log}.diff" 2>&1; then
+                  :
+                else
+                  diff_status=$?
+                  if [[ "$diff_status" -gt 1 ]]; then
+                    echo "diff failed while recording parser disagreement for $exe" >&2
+                    failed=1
+                  fi
+                fi
+              fi
+            fi
+
+            if [[ "$strict_ok" == "1" ]]; then
+              classify_import_file() {
+                local import_file="$1"
+                local import_kind="$2"
+                local dll=""
+                local gcc_lookup=""
+                local where_output=""
+                local where_path=""
+                local where_status=""
+                local resolved=""
+                local archive=""
+                local archive_path=""
+                while IFS= read -r dll; do
+                  [[ -n "$dll" ]] || continue
+                  case "$dll" in
+                    api-ms-win-*.dll|ext-ms-win-*.dll)
+                      printf '%s WINDOWS_API_SET_CONTRACT %s (minimum target OS not validated)\n' "$import_kind" "$dll"
+                      ;;
+                    advapi32.dll|bcrypt.dll|cfgmgr32.dll|comdlg32.dll|crypt32.dll|dnsapi.dll|gdi32.dll|iphlpapi.dll|kernel32.dll|kernelbase.dll|msvcrt.dll|netapi32.dll|ntdll.dll|ole32.dll|oleaut32.dll|powrprof.dll|psapi.dll|rpcrt4.dll|secur32.dll|setupapi.dll|shell32.dll|shlwapi.dll|user32.dll|userenv.dll|version.dll|winhttp.dll|wininet.dll|winmm.dll|ws2_32.dll|wtsapi32.dll|ucrtbase.dll)
+                      printf '%s WINDOWS_OS_MODULE %s (name classified; compatibility with minimum Windows release not proven by runner presence)\n' "$import_kind" "$dll"
+                      ;;
+                    lib*.dll|mingw*.dll|msys-*.dll)
+                      if ! gcc_lookup="$(gcc -print-file-name="$dll" | tr -d '\r')"; then
+                        echo "GCC runtime lookup failed for $dll" >&2
+                        return 1
                       fi
-                    fi
-                    printf 'GCC runtime lookup: %s -> %s\n' "$dll" "$gcc_path"
-                    printf 'PATH lookup for %s:\n%s\n' "$dll" "${where_output:-not found}"
-                    if [[ -z "$resolved" || ! -f "$resolved" ]]; then
-                      echo "Unresolved MinGW/GCC runtime dependency: $dll (GCC lookup: $gcc_path; PATH lookup: ${where_path:-not found})" >&2
-                      exit 1
-                    fi
-                    printf 'Resolved DLL path: %s\n' "$resolved"
-                    if [[ "$dll" == "libwinpthread-1.dll" ]]; then
-                      printf 'MINGW_PTHREAD_RUNTIME %s (QuickJS cgo configuration requests -lpthread in component/quickjs/quickjs_cgo.go; distribution packaging decision required)\n' "$dll"
-                      for archive in libpthread.a libwinpthread.a libwinpthread.dll.a; do
-                        archive_path="$(gcc -print-file-name="$archive" | tr -d '\r')"
-                        if [[ "$archive_path" != "$archive" && -f "$archive_path" ]]; then
-                          printf 'LINK_ARCHIVE_CANDIDATE %s -> %s (availability only; archive type and static link not verified)\n' "$archive" "$archive_path"
-                        else
-                          printf 'STATIC_LINK_CANDIDATE_NOT_FOUND %s -> %s\n' "$archive" "$archive_path"
+                      if where_output="$(where.exe "$dll" 2>&1)"; then where_status=found; else where_status=not-found; fi
+                      where_path="$(printf '%s\n' "$where_output" | sed -n '1p' | tr -d '\r')"
+                      resolved="$gcc_lookup"
+                      if [[ "$resolved" == "$dll" || ! -f "$resolved" ]]; then
+                        if [[ -n "$where_path" ]] && command -v cygpath >/dev/null 2>&1; then
+                          if ! resolved="$(cygpath -u "$where_path" 2>/dev/null)"; then resolved=""; fi
                         fi
-                      done
-                    else
-                      printf 'THIRD_PARTY_GCC_RUNTIME %s -> %s (distribution packaging decision required)\n' "$dll" "$resolved"
-                    fi
-                    ;;
-                  *)
-                    echo "Unclassified DLL import; review provenance and target availability: $dll" >&2
-                    exit 1
-                    ;;
-                esac
-              done < "$imports_file"
-            } 2>&1 | tee "$runtime_log"
+                      fi
+                      printf '%s GCC runtime lookup: %s -> %s\n' "$import_kind" "$dll" "$gcc_lookup"
+                      printf '%s PATH lookup (%s):\n%s\n' "$import_kind" "$where_status" "${where_output:-not found}"
+                      if [[ -z "$resolved" || ! -f "$resolved" ]]; then
+                        echo "Unresolved MinGW/GCC runtime dependency: $dll (GCC lookup: $gcc_lookup; PATH lookup: ${where_path:-not found})" >&2
+                        return 1
+                      fi
+                      printf '%s Resolved DLL path: %s\n' "$import_kind" "$resolved"
+                      if [[ "$dll" == "libwinpthread-1.dll" ]]; then
+                        printf '%s MINGW_PTHREAD_RUNTIME %s (QuickJS cgo configuration requests -lpthread in component/quickjs/quickjs_cgo.go; distribution packaging decision required)\n' "$import_kind" "$dll"
+                        for archive in libpthread.a libwinpthread.a libwinpthread.dll.a; do
+                          if ! archive_path="$(gcc -print-file-name="$archive" | tr -d '\r')"; then
+                            echo "GCC archive lookup failed for $archive" >&2
+                            return 1
+                          fi
+                          if [[ "$archive_path" != "$archive" && -f "$archive_path" ]]; then
+                            printf 'LINK_ARCHIVE_CANDIDATE %s -> %s (availability only; archive type and static link not verified)\n' "$archive" "$archive_path"
+                          else
+                            printf 'STATIC_LINK_CANDIDATE_NOT_FOUND %s -> %s\n' "$archive" "$archive_path"
+                          fi
+                        done
+                      else
+                        printf '%s THIRD_PARTY_GCC_RUNTIME %s -> %s (distribution packaging decision required)\n' "$import_kind" "$dll" "$resolved"
+                      fi
+                      ;;
+                    *)
+                      echo "Unclassified DLL import; review provenance and target availability: $dll" >&2
+                      return 1
+                      ;;
+                  esac
+                done < "$import_file"
+              }
+              classification_failed=0
+              if {
+                echo "Executable: $exe"
+                echo "Direct DLL imports:"
+                if [[ -s "$imports_file" ]]; then cat "$imports_file"; else echo "VALID_EMPTY_IMPORT_DIRECTORY (does not prove static linking)"; fi
+                classify_import_file "$imports_file" direct || classification_failed=1
+                echo "Delay DLL imports:"
+                if [[ -s "$delay_file" ]]; then cat "$delay_file"; else echo "VALID_EMPTY_DELAY_IMPORT_DIRECTORY"; fi
+                classify_import_file "$delay_file" delay || classification_failed=1
+                echo "CLASSIFICATION_FAILED=$classification_failed"
+              } > "$runtime_log" 2>&1; then
+                cat "$runtime_log"
+                if [[ "$classification_failed" != "0" ]]; then failed=1; fi
+              else
+                cat "$runtime_log" >&2
+                failed=1
+              fi
+            fi
+            return "$failed"
           }
 
           inspection_failed=0
           inspect_pe "$test_bin" quickjs-test || inspection_failed=1
           inspect_pe "$main_bin" mihomo-main || inspection_failed=1
-          if [[ ! -f artifacts/quickjs-ci/quickjs-test-dll-imports.txt ]]; then
-            echo "QuickJS test executable DLL import result unavailable because PE inspection failed"
-          elif grep -Fxiq 'libwinpthread-1.dll' artifacts/quickjs-ci/quickjs-test-dll-imports.txt; then
-            echo "QuickJS test executable directly imports libwinpthread-1.dll"
-          else
-            echo "QuickJS test executable does not directly import libwinpthread-1.dll"
-          fi
-          if [[ ! -f artifacts/quickjs-ci/mihomo-main-dll-imports.txt ]]; then
-            echo "Main executable DLL import result unavailable because PE inspection failed"
-          elif grep -Fxiq 'libwinpthread-1.dll' artifacts/quickjs-ci/mihomo-main-dll-imports.txt; then
-            echo "Main executable directly imports libwinpthread-1.dll"
-          else
-            echo "Main executable does not directly import libwinpthread-1.dll"
-          fi
+          for imports_file in \
+            artifacts/quickjs-ci/quickjs-test-dll-imports.txt \
+            artifacts/quickjs-ci/mihomo-main-dll-imports.txt; do
+            if [[ -f "$imports_file" ]]; then
+              if grep -Fxiq 'libwinpthread-1.dll' "$imports_file"; then
+                echo "$imports_file directly imports libwinpthread-1.dll"
+              else
+                echo "$imports_file does not directly import libwinpthread-1.dll"
+              fi
+            else
+              echo "$imports_file unavailable because strict PE inspection failed"
+            fi
+          done
           exit "$inspection_failed"
 
       - name: Inspect Linux shared library dependencies
