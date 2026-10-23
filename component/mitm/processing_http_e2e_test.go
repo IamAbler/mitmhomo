@@ -3,6 +3,7 @@ package mitm
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -266,6 +267,37 @@ func TestM52GojaTimeoutAndBodyLimitHTTPMappings(t *testing.T) {
 		require.NotContains(t, body, "unknown-internal-value")
 		require.NotContains(t, body, "private")
 	})
+}
+
+func TestM52ProcessingFailureErrorMappings(t *testing.T) {
+	processingError := func(kind model.ProcessingErrorKind, origin model.ProcessingErrorOrigin, phase model.Phase) error {
+		return model.NewProcessingError(kind, origin, phase, "m52-mapping", "mapping-test", errors.New("private processor detail"))
+	}
+	tests := []struct {
+		name  string
+		err   error
+		phase model.Phase
+		want  int
+	}{
+		{name: "processor timeout", err: processingError(model.ProcessingErrorTimeout, model.ProcessingOriginProcessor, model.RequestPhase), phase: model.RequestPhase, want: http.StatusGatewayTimeout},
+		{name: "context canceled", err: context.Canceled, phase: model.RequestPhase, want: 0},
+		{name: "request body limit", err: processingError(model.ProcessingErrorBodyLimitExceeded, model.ProcessingOriginRequest, model.RequestPhase), phase: model.RequestPhase, want: http.StatusRequestEntityTooLarge},
+		{name: "response body limit", err: processingError(model.ProcessingErrorBodyLimitExceeded, model.ProcessingOriginRequest, model.ResponsePhase), phase: model.ResponsePhase, want: http.StatusBadGateway},
+		{name: "request output limit", err: processingError(model.ProcessingErrorOutputLimitExceeded, model.ProcessingOriginProcessor, model.RequestPhase), phase: model.RequestPhase, want: http.StatusRequestEntityTooLarge},
+		{name: "response output limit", err: processingError(model.ProcessingErrorOutputLimitExceeded, model.ProcessingOriginProcessor, model.ResponsePhase), phase: model.ResponsePhase, want: http.StatusBadGateway},
+		{name: "capacity exhausted", err: processingError(model.ProcessingErrorCapacityExhausted, model.ProcessingOriginProcessor, model.RequestPhase), phase: model.RequestPhase, want: http.StatusServiceUnavailable},
+		{name: "invalid result", err: processingError(model.ProcessingErrorInvalidOutput, model.ProcessingOriginProcessor, model.RequestPhase), phase: model.RequestPhase, want: http.StatusInternalServerError},
+		{name: "response processor failure", err: processingError(model.ProcessingErrorExecution, model.ProcessingOriginProcessor, model.ResponsePhase), phase: model.ResponsePhase, want: http.StatusBadGateway},
+		{name: "upstream failure", err: processingError(model.ProcessingErrorUpstream, model.ProcessingOriginUpstream, model.ResponsePhase), phase: model.ResponsePhase, want: http.StatusBadGateway},
+		{name: "irreversible I/O failure", err: processingError(model.ProcessingErrorIrreversibleIOFailure, model.ProcessingOriginUpstream, model.ResponsePhase), phase: model.ResponsePhase, want: http.StatusBadGateway},
+		{name: "resource cleanup failure", err: processingError(model.ProcessingErrorCleanupFailure, model.ProcessingOriginConnection, model.RequestPhase), phase: model.RequestPhase, want: http.StatusServiceUnavailable},
+		{name: "invalid protocol input", err: model.ErrInvalid, phase: model.RequestPhase, want: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.want, processingFailureStatus(test.err, test.phase))
+		})
+	}
 }
 
 func TestM52LegacyScriptPrecedesGojaWithoutDoubleExecution(t *testing.T) {
