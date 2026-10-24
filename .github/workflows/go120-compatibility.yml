@@ -1,0 +1,178 @@
+name: Go 1.20 Compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - Alpha
+      - validation/go120-compatibility
+  pull_request:
+    branches:
+      - Alpha
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go120-compat-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  linux:
+    name: Linux amd64 / Go 1.20
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify toolchain and dependency graph
+        run: |
+          go version
+          go env
+          go list -m -f '{{.Path}} {{.GoVersion}}' all > "$RUNNER_TEMP/go120-modules.txt"
+          awk '
+            NF >= 2 && $2 != "" {
+              split($2, version, ".")
+              if (version[1] > 1 || (version[1] == 1 && version[2] > 20)) {
+                print "dependency requires Go newer than 1.20: " $0
+                failed = 1
+              }
+            }
+            END { exit failed }
+          ' "$RUNNER_TEMP/go120-modules.txt"
+          go mod download all
+          go mod verify
+      - name: Test default build
+        run: go test ./... -count=1
+      - name: Test with_gvisor
+        run: go test -tags with_gvisor ./... -count=1
+      - name: Build default packages
+        run: go build ./...
+
+  linux-quickjs-cgo:
+    name: Linux amd64 / Go 1.20 / QuickJS CGO
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "1"
+      CC: gcc
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify native C toolchain
+        run: |
+          go version
+          test "$(go env CGO_ENABLED)" = "1"
+          test "$(gcc -dumpmachine)" = "x86_64-linux-gnu"
+      - name: Test QuickJS package
+        run: go test -tags quickjs ./component/quickjs -count=1
+      - name: Build all packages with QuickJS
+        run: go build -tags quickjs ./...
+
+  linux-quickjs-stub:
+    name: Linux amd64 / Go 1.20 / QuickJS Stub
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Test QuickJS Stub package
+        run: go test -tags quickjs ./component/quickjs -count=1
+      - name: Build all packages with QuickJS Stub
+        run: go build -tags quickjs ./...
+
+  windows:
+    name: Windows amd64 / Go 1.20
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify toolchain and build
+        run: |
+          go version
+          test "$(go env GOOS)" = "windows"
+          test "$(go env GOARCH)" = "amd64"
+          go build ./...
+
+  windows-quickjs-cgo:
+    name: Windows amd64 / Go 1.20 / QuickJS CGO
+    runs-on: windows-2025
+    env:
+      CGO_ENABLED: "1"
+      CC: gcc
+      MSYS_NO_PATHCONV: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify native Windows C toolchain
+        run: |
+          go version
+          test "$(go env GOOS)" = "windows"
+          test "$(go env GOARCH)" = "amd64"
+          test "$(go env CGO_ENABLED)" = "1"
+          target="$(gcc -dumpmachine)"
+          [[ "$target" == x86_64-w64-mingw32* ]]
+      - name: Test QuickJS package
+        run: go test -tags quickjs ./component/quickjs -count=1
+      - name: Build all packages with QuickJS
+        run: go build -tags quickjs ./...
+
+  macos:
+    name: macOS ${{ matrix.arch }} / Go 1.20
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26-intel
+            arch: amd64
+          - runner: macos-latest
+            arch: arm64
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify toolchain and build
+        run: |
+          go version
+          test "$(go env GOOS)" = "darwin"
+          test "$(go env GOARCH)" = "${{ matrix.arch }}"
+          go build ./...
+
+  linux-race:
+    name: Linux amd64 / Go 1.20 / Race
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Run concurrency tests with the race detector
+        run: go test -race ./common/contextutils ./component/mitm/scriptapi -count=1

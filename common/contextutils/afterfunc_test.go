@@ -2,6 +2,7 @@ package contextutils
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -96,5 +97,47 @@ func TestAfterFuncCalledAsynchronously(t *testing.T) {
 	case <-donec:
 	case <-time.After(veryLongDuration):
 		t.Fatalf("AfterFunc not called after context is canceled")
+	}
+}
+
+func TestAfterFuncStopRacesWithCancel(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		var calls atomic.Int32
+		called := make(chan struct{}, 1)
+		stop := afterFunc(ctx, func() {
+			calls.Add(1)
+			called <- struct{}{}
+		})
+
+		start := make(chan struct{})
+		stopped := make(chan bool, 1)
+		go func() {
+			<-start
+			stopped <- stop()
+		}()
+		go func() {
+			<-start
+			cancel()
+		}()
+		close(start)
+
+		if stopWon := <-stopped; stopWon {
+			select {
+			case <-called:
+				t.Fatal("callback ran after stop won the race")
+			default:
+			}
+		} else {
+			select {
+			case <-called:
+			case <-time.After(time.Second):
+				t.Fatal("callback did not run after cancellation won the race")
+			}
+		}
+		cancel()
+		if got := calls.Load(); got > 1 {
+			t.Fatalf("callback ran %d times, want at most once", got)
+		}
 	}
 }

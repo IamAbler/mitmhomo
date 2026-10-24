@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/component/mitm/scripthost"
 )
 
@@ -266,7 +267,7 @@ func (h *Host) scheduleHTTP(ctx context.Context, session scripthost.Session, cal
 			task.cancel()
 			return nil, context.Cause(sessionCtx)
 		}
-		stopSession := context.AfterFunc(sessionCtx, task.cancel)
+		stopSession := contextutils.AfterFunc(sessionCtx, task.cancel)
 		defer stopSession()
 		requestCtx, cancel := context.WithTimeout(task.ctx, timeout)
 		defer cancel()

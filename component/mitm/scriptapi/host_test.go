@@ -399,6 +399,36 @@ func TestSessionCancellationRacesWithHTTPResponse(t *testing.T) {
 	}
 }
 
+func TestAlreadyCanceledSessionDoesNotStartHTTPRequest(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte("unexpected"))
+	}))
+	defer server.Close()
+	host, err := NewHost(HostConfig{Namespace: "already-canceled", AllowPrivate: true, HTTPClients: testHTTPClientFactory(server.Client())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	before, _ := HTTPTaskStats()
+	session := &contractSession{}
+	if err := callHostHTTP(host, session, server.URL); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := session.work(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("already-canceled session work error = %v, want context.Canceled", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("requests started with an already-canceled session = %d, want 0", requests.Load())
+	}
+	if active, _ := HTTPTaskStats(); active != before {
+		t.Fatalf("active HTTP task count after already-canceled session = %d, want %d", active, before)
+	}
+}
+
 func TestHostCloseClosesResponseBodyAndIdleConnection(t *testing.T) {
 	bodyRead := make(chan struct{})
 	bodyClosed := make(chan struct{})
