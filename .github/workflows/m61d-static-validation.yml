@@ -35,12 +35,38 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Go 1.26.10
+      - name: Set up MetaCubeX Go 1.26
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.26.10"
+          go-version: "1.26"
           go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
           cache: false
+
+      - name: Verify MetaCubeX Go toolchain
+        if: ${{ always() && !cancelled() }}
+        run: |
+          set -euo pipefail
+          artifact_dir="artifacts/m61d-static/windows-amd64"
+          mkdir -p "$artifact_dir"
+          {
+            echo "go_version_spec=1.26"
+            echo "go_expected_version=go1.26.10"
+            echo "go_download_base_url=https://github.com/MetaCubeX/go/releases/download/build"
+            echo "go_release_asset_url=https://github.com/MetaCubeX/go/releases/download/build/go1.26.windows-amd64.zip"
+            if command -v go >/dev/null 2>&1; then
+              go_binary="$(command -v go)"
+              go_actual_version="$(go env GOVERSION)"
+              go_binary_sha256="$(sha256sum "$go_binary" | awk '{print $1}')"
+              echo "go_actual_version=$go_actual_version"
+              echo "go_binary=$go_binary"
+              echo "go_binary_sha256=$go_binary_sha256"
+              go version
+              test "$go_actual_version" = "go1.26.10"
+            else
+              echo "go_actual_version=NOT_FOUND"
+              exit 1
+            fi
+          } 2>&1 | tee "$artifact_dir/go-install-verification.log"
 
       - name: Prepare artifact directory and inspect toolchain
         run: |
@@ -117,12 +143,38 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Go 1.26.10
+      - name: Set up MetaCubeX Go 1.26
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
-          go-version: "1.26.10"
+          go-version: "1.26"
           go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
           cache: false
+
+      - name: Verify MetaCubeX Go toolchain
+        if: ${{ always() && !cancelled() }}
+        run: |
+          set -euo pipefail
+          artifact_dir="artifacts/m61d-static/linux-amd64"
+          mkdir -p "$artifact_dir"
+          {
+            echo "go_version_spec=1.26"
+            echo "go_expected_version=go1.26.10"
+            echo "go_download_base_url=https://github.com/MetaCubeX/go/releases/download/build"
+            echo "go_release_asset_url=https://github.com/MetaCubeX/go/releases/download/build/go1.26.linux-amd64.tar.gz"
+            if command -v go >/dev/null 2>&1; then
+              go_binary="$(command -v go)"
+              go_actual_version="$(go env GOVERSION)"
+              go_binary_sha256="$(sha256sum "$go_binary" | awk '{print $1}')"
+              echo "go_actual_version=$go_actual_version"
+              echo "go_binary=$go_binary"
+              echo "go_binary_sha256=$go_binary_sha256"
+              go version
+              test "$go_actual_version" = "go1.26.10"
+            else
+              echo "go_actual_version=NOT_FOUND"
+              exit 1
+            fi
+          } 2>&1 | tee "$artifact_dir/go-install-verification.log"
 
       - name: Download and install pinned Ubuntu musl packages
         run: |
