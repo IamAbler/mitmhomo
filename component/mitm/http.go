@@ -365,46 +365,7 @@ func (m *Manager) serveTLSConnection(ctx context.Context, conn net.Conn, metadat
 					return fmt.Errorf("unexpected response processing outcome %d", responseReport.Outcome)
 				}
 			},
-			ErrorHandler: func(errorWriter http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
-				if trackedWriter.Committed() {
-					panic(http.ErrAbortHandler)
-				}
-				if errors.Is(roundTripErr, errProcessingAborted) {
-					panic(http.ErrAbortHandler)
-				}
-				if errors.Is(roundTripErr, errProcessingRejected) {
-					http.Error(errorWriter, "response rejected", http.StatusForbidden)
-					return
-				}
-				requestErr := proxyRequest.Context().Err()
-				requestCause := context.Cause(proxyRequest.Context())
-				requestTimedOut := errors.Is(roundTripErr, context.DeadlineExceeded) || errors.Is(requestErr, context.DeadlineExceeded) || errors.Is(requestCause, context.DeadlineExceeded)
-				if errors.Is(requestErr, context.Canceled) && !requestTimedOut && discardedBody != nil {
-					requestTimedOut = isTimeoutError(discardedBody.resultAfterDone().err)
-				}
-				if errors.Is(requestErr, context.Canceled) && !requestTimedOut {
-					return
-				}
-				status := http.StatusBadGateway
-				if requestTimedOut {
-					status = http.StatusGatewayTimeout
-				} else {
-					var processingErr *model.ProcessingError
-					if errors.As(roundTripErr, &processingErr) {
-						status = processingFailureStatus(roundTripErr, model.ResponsePhase)
-					}
-				}
-				if status == 0 {
-					return
-				}
-				message := "upstream request failed"
-				if status == http.StatusGatewayTimeout {
-					message = "upstream request timed out"
-				} else if status == http.StatusServiceUnavailable {
-					message = "HTTP processing capacity is unavailable"
-				}
-				http.Error(errorWriter, message, status)
-			},
+			ErrorHandler: upstreamErrorHandler(trackedWriter, discardedBody),
 		}
 		proxyWriter := http.ResponseWriter(trackedWriter)
 		if discardedBody != nil {
@@ -772,9 +733,88 @@ func (discard *requestBodyDiscard) resultAfterDone() requestBodyDiscardResult {
 	return discard.result
 }
 
+func upstreamErrorHandler(
+	trackedWriter *commitTrackingWriter,
+	discardedBody *requestBodyDiscard,
+) func(http.ResponseWriter, *http.Request, error) {
+	return func(errorWriter http.ResponseWriter, proxyRequest *http.Request, roundTripErr error) {
+		if trackedWriter.Committed() {
+			panic(http.ErrAbortHandler)
+		}
+		if errors.Is(roundTripErr, errProcessingAborted) {
+			panic(http.ErrAbortHandler)
+		}
+		if errors.Is(roundTripErr, errProcessingRejected) {
+			http.Error(errorWriter, "response rejected", http.StatusForbidden)
+			return
+		}
+		requestErr := proxyRequest.Context().Err()
+		requestCause := context.Cause(proxyRequest.Context())
+		var discardedBodyErr error
+		if errors.Is(requestErr, context.Canceled) &&
+			!errors.Is(requestCause, context.DeadlineExceeded) &&
+			!isUpstreamRoundTripTimeout(roundTripErr) && discardedBody != nil {
+			discardedBodyErr = discardedBody.resultAfterDone().err
+		}
+		requestTimedOut := isRequestTimeoutError(roundTripErr, requestErr, requestCause, discardedBodyErr)
+		if errors.Is(requestErr, context.Canceled) && !requestTimedOut {
+			return
+		}
+		status := http.StatusBadGateway
+		if requestTimedOut {
+			status = http.StatusGatewayTimeout
+		} else {
+			var processingErr *model.ProcessingError
+			if errors.As(roundTripErr, &processingErr) {
+				status = processingFailureStatus(roundTripErr, model.ResponsePhase)
+			}
+		}
+		if status == 0 {
+			return
+		}
+		message := "upstream request failed"
+		if status == http.StatusGatewayTimeout {
+			message = "upstream request timed out"
+		} else if status == http.StatusServiceUnavailable {
+			message = "HTTP processing capacity is unavailable"
+		}
+		http.Error(errorWriter, message, status)
+	}
+}
+
 func isTimeoutError(err error) bool {
 	var networkError net.Error
 	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+func isRequestTimeoutError(roundTripErr, requestErr, requestCause, discardedBodyErr error) bool {
+	if errors.Is(requestErr, context.DeadlineExceeded) || errors.Is(requestCause, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(requestErr, context.Canceled) {
+		return isTimeoutError(discardedBodyErr)
+	}
+	return isUpstreamRoundTripTimeout(roundTripErr)
+}
+
+func isUpstreamRoundTripTimeout(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || isHTTP1ResponseHeaderTimeout(err)
+}
+
+// Go 1.20's net/http ResponseHeaderTimeout error implements net.Error but not
+// Is(context.DeadlineExceeded). Match its source-specific message so unrelated
+// network timeouts keep the existing Bad Gateway behavior.
+func isHTTP1ResponseHeaderTimeout(err error) bool {
+	var networkError net.Error
+	if !errors.As(err, &networkError) || !networkError.Timeout() {
+		return false
+	}
+	for wrapped := err; wrapped != nil; wrapped = errors.Unwrap(wrapped) {
+		if wrapped.Error() == "net/http: timeout awaiting response headers" {
+			return true
+		}
+	}
+	return false
 }
 
 func (discard *requestBodyDiscard) forceClose(w http.ResponseWriter) {

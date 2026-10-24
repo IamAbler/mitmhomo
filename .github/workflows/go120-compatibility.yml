@@ -266,6 +266,179 @@ jobs:
           fi
           exit "$test_status"
 
+  linux-mitm-timeout-repeat:
+    if: github.ref == 'refs/heads/validation/go120-compatibility'
+    name: Linux amd64 / Go 1.20.14 / MITM timeout repeat / ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - profile: default x50
+            tags: ""
+            cgo: "0"
+            race: "false"
+            count: "50"
+          - profile: with_gvisor x50
+            tags: with_gvisor
+            cgo: "0"
+            race: "false"
+            count: "50"
+          - profile: default Race x10
+            tags: ""
+            cgo: "1"
+            race: "true"
+            count: "10"
+          - profile: with_gvisor Race x10
+            tags: with_gvisor
+            cgo: "1"
+            race: "true"
+            count: "10"
+    env:
+      CGO_ENABLED: ${{ matrix.cgo }}
+      CC: gcc
+      MITM_TIMEOUT_TEST_TAGS: ${{ matrix.tags }}
+      MITM_TIMEOUT_TEST_RACE: ${{ matrix.race }}
+      MITM_TIMEOUT_TEST_COUNT: ${{ matrix.count }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify Go 1.20.14 toolchain
+        run: |
+          go version
+          test "$(go version)" = "go version go1.20.14 linux/amd64"
+          test "$(go env CGO_ENABLED)" = "$CGO_ENABLED"
+      - name: Repeat focused MITM timeout regressions
+        shell: bash
+        run: |
+          test_pattern='^(TestM2Go120ResponseHeaderTimeoutErrorCompatibility|TestM2ResponseHeaderTimeoutIsClassifiedAsGatewayTimeout|TestM2ResponseHeaderTimeoutReturns504ThroughProductionErrorHandler|TestM2RequestContextDeadlineRemainsGatewayTimeout|TestM2ActiveUpstreamRequestCancellationIsNotGatewayTimeout|TestM2OrdinaryUpstreamErrorsAreNotGatewayTimeouts|TestM2RequestTimeoutAndAbnormalUpstreamDisconnect|TestM2ClientCancellationClosesRewrittenUpstreamConnection)$'
+          args=(-json -count "$MITM_TIMEOUT_TEST_COUNT" -run "$test_pattern")
+          if [[ "$MITM_TIMEOUT_TEST_RACE" == "true" ]]; then
+            args+=(-race)
+          fi
+          if [[ -n "$MITM_TIMEOUT_TEST_TAGS" ]]; then
+            args+=(-tags "$MITM_TIMEOUT_TEST_TAGS")
+          fi
+          args+=(./component/mitm)
+
+          log_file="$RUNNER_TEMP/mitm-timeout-repeat.jsonl"
+          set +e
+          go test "${args[@]}" > "$log_file" 2>&1
+          test_status=$?
+          set -e
+          cat "$log_file"
+
+          set +e
+          python3 - "$log_file" "$MITM_TIMEOUT_TEST_COUNT" "$test_status" <<'PY'
+          from collections import Counter
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          log_path = Path(sys.argv[1])
+          expected_count = int(sys.argv[2])
+          test_status = int(sys.argv[3])
+          targets = (
+              "TestM2Go120ResponseHeaderTimeoutErrorCompatibility",
+              "TestM2ResponseHeaderTimeoutIsClassifiedAsGatewayTimeout",
+              "TestM2ResponseHeaderTimeoutReturns504ThroughProductionErrorHandler",
+              "TestM2RequestContextDeadlineRemainsGatewayTimeout",
+              "TestM2ActiveUpstreamRequestCancellationIsNotGatewayTimeout",
+              "TestM2OrdinaryUpstreamErrorsAreNotGatewayTimeouts",
+              "TestM2RequestTimeoutAndAbnormalUpstreamDisconnect",
+              "TestM2ClientCancellationClosesRewrittenUpstreamConnection",
+          )
+          expected_status = {
+              "go120_error_handler": 504,
+              "response_header_handler": 504,
+              "request_context_deadline": 504,
+              "body_discard_timeout": 504,
+              "upstream_request_timeout": 504,
+              "connection_refused": 502,
+              "abrupt_disconnect": 502,
+          }
+          expected_cancellations = {
+              "concurrent_response_timeout": "committed=false body_bytes=0",
+              "active_upstream_roundtrip": "classified_timeout=false",
+              "downstream_disconnect": "upstream_closed=true",
+          }
+          passed = Counter()
+          failed = Counter()
+          failures = []
+          statuses = Counter()
+          cancellations = Counter()
+          unparsed = []
+          status_pattern = re.compile(r"M2_TIMEOUT_STATUS scenario=(\S+) got=(\d+) want=(\d+)")
+          for raw in log_path.read_text(errors="replace").splitlines():
+              try:
+                  event = json.loads(raw)
+              except json.JSONDecodeError:
+                  if raw.strip():
+                      unparsed.append(raw)
+                  continue
+              name = event.get("Test", "")
+              action = event.get("Action")
+              if name in targets and action == "pass":
+                  passed[name] += 1
+              elif name in targets and action == "fail":
+                  failed[name] += 1
+                  failures.append(name)
+              elif action == "fail" and name.startswith("TestM2"):
+                  failures.append(name)
+              if action == "output":
+                  output = event.get("Output", "")
+                  status_match = status_pattern.search(output)
+                  if status_match:
+                      scenario, got, want = status_match.groups()
+                      statuses[(scenario, int(got), int(want))] += 1
+                  for scenario, expected in expected_cancellations.items():
+                      if f"M2_TIMEOUT_CANCEL scenario={scenario} {expected}" in output:
+                          cancellations[scenario] += 1
+
+          print(f"MITM_TIMEOUT_REPEAT_SUMMARY: EXPECTED_PER_TEST={expected_count} TEST_EXIT={test_status}")
+          for target in targets:
+              print(f"MITM_TIMEOUT_TEST: {target} PASS={passed[target]} FAIL={failed[target]} TOTAL={passed[target] + failed[target]}")
+          for scenario, want in expected_status.items():
+              total = sum(count for (name, _, _), count in statuses.items() if name == scenario)
+              passed_status = sum(count for (name, got, expected), count in statuses.items() if name == scenario and got == expected == want)
+              print(f"MITM_TIMEOUT_STATUS: {scenario} EXPECTED={want} PASS={passed_status} TOTAL={total}")
+          for scenario in expected_cancellations:
+              print(f"MITM_TIMEOUT_CANCEL: {scenario} PASS={cancellations[scenario]} EXPECTED={expected_count}")
+          for name in sorted(set(failures)):
+              print(f"MITM_TIMEOUT_FAILURE: {name}")
+          for line in unparsed:
+              print(f"MITM_TIMEOUT_UNPARSED_LOG: {line}")
+
+          missing_tests = [name for name in targets if passed[name] + failed[name] != expected_count]
+          missing_status = [name for name in expected_status if sum(count for (scenario, _, _), count in statuses.items() if scenario == name) != expected_count]
+          bad_status = [name for name, want in expected_status.items() if sum(count for (scenario, got, expected), count in statuses.items() if scenario == name and got == expected == want) != expected_count]
+          missing_cancel = [name for name in expected_cancellations if cancellations[name] != expected_count]
+          if missing_tests or missing_status or bad_status or missing_cancel or failures:
+              print(f"MITM_TIMEOUT_VALIDATION_ERROR: missing_tests={missing_tests} missing_status={missing_status} bad_status={bad_status} missing_cancel={missing_cancel}")
+              sys.exit(2)
+          if test_status:
+              sys.exit(test_status)
+          PY
+          parser_status=$?
+          set -e
+          if [[ "$parser_status" -ne 0 ]]; then
+            exit "$parser_status"
+          fi
+          exit "$test_status"
+      - name: Upload timeout regression log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: mitm-timeout-repeat-${{ matrix.profile }}
+          path: ${{ runner.temp }}/mitm-timeout-repeat.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
   linux-m1-repeat:
     name: Linux amd64 / Go 1.20 / M1 repeat / ${{ matrix.profile }}
     runs-on: ubuntu-24.04

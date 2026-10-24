@@ -866,6 +866,7 @@ func TestM2RequestTimeoutAndAbnormalUpstreamDisconnect(t *testing.T) {
 		response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
 		require.NoError(t, err)
 		require.Equal(t, http.StatusGatewayTimeout, response.StatusCode, "request timeout must take precedence over the unfinished discarded body")
+		logM2TimeoutStatus(t, "body_discard_timeout", response.StatusCode, http.StatusGatewayTimeout)
 		require.True(t, response.Close)
 		_ = readM2ResponseBody(t, response)
 		select {
@@ -891,6 +892,7 @@ func TestM2RequestTimeoutAndAbnormalUpstreamDisconnect(t *testing.T) {
 		client, done := h.startClient(t)
 		response := sendM2Request(t, client, bufio.NewReader(client), "GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n", http.MethodGet)
 		require.Equal(t, http.StatusGatewayTimeout, response.StatusCode)
+		logM2TimeoutStatus(t, "upstream_request_timeout", response.StatusCode, http.StatusGatewayTimeout)
 		_ = readM2ResponseBody(t, response)
 		select {
 		case <-started:
@@ -902,6 +904,23 @@ func TestM2RequestTimeoutAndAbnormalUpstreamDisconnect(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("request timeout did not cancel upstream work")
 		}
+		require.EqualValues(t, 1, h.dialCount.Load())
+		finishM2Dispatch(t, client, done)
+	})
+
+	t.Run("upstream connection refused", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		upstreamAddr := listener.Addr().String()
+		require.NoError(t, listener.Close())
+
+		h := newM2HTTPHarness(t, "localhost", nil, nil)
+		h.upstreamAddr = upstreamAddr
+		client, done := h.startClient(t)
+		response := sendM2Request(t, client, bufio.NewReader(client), "GET /refused HTTP/1.1\r\nHost: localhost\r\n\r\n", http.MethodGet)
+		require.Equal(t, http.StatusBadGateway, response.StatusCode)
+		logM2TimeoutStatus(t, "connection_refused", response.StatusCode, http.StatusBadGateway)
+		_ = readM2ResponseBody(t, response)
 		require.EqualValues(t, 1, h.dialCount.Load())
 		finishM2Dispatch(t, client, done)
 	})
@@ -920,6 +939,7 @@ func TestM2RequestTimeoutAndAbnormalUpstreamDisconnect(t *testing.T) {
 		client, done := h.startClient(t)
 		response := sendM2Request(t, client, bufio.NewReader(client), "GET /disconnect HTTP/1.1\r\nHost: localhost\r\n\r\n", http.MethodGet)
 		require.Equal(t, http.StatusBadGateway, response.StatusCode)
+		logM2TimeoutStatus(t, "abrupt_disconnect", response.StatusCode, http.StatusBadGateway)
 		_ = readM2ResponseBody(t, response)
 		require.EqualValues(t, 1, h.dialCount.Load())
 		finishM2Dispatch(t, client, done)
@@ -988,6 +1008,7 @@ func TestM2ClientCancellationClosesRewrittenUpstreamConnection(t *testing.T) {
 		t.Fatal("canceled M2 HTTP connection did not release")
 	}
 	require.EqualValues(t, 1, h.dialCount.Load())
+	t.Log("M2_TIMEOUT_CANCEL scenario=downstream_disconnect upstream_closed=true")
 }
 
 func TestM2BodyReplacementForwardsStaticReader(t *testing.T) {
