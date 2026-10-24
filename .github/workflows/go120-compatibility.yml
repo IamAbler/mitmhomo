@@ -220,6 +220,18 @@ jobs:
       - name: Repeat focused MITM test 50 times
         shell: bash
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("component/mitm/http_m2_test.go")
+          source = path.read_text()
+          original = "\t_, err := io.WriteString(client, request)\n\trequire.NoError(t, err)"
+          diagnostic = "\tn, err := io.WriteString(client, request)\n\tt.Logf(\"M2_DIAG request_write_bytes=%d expected_bytes=%d err=%v\", n, len(request), err)\n\trequire.NoError(t, err)"
+          if source.count(original) != 1:
+              raise SystemExit("could not uniquely add runner-only M2 write diagnostics")
+          path.write_text(source.replace(original, diagnostic, 1))
+          PY
+
           args=()
           if [[ "$MITM_TEST_RACE" == "true" ]]; then
             args+=(-race)
@@ -235,6 +247,7 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/mitm-repeat.log"
 
+          set +e
           python3 - "$RUNNER_TEMP/mitm-repeat.log" <<'PY'
           from pathlib import Path
           import sys
@@ -247,7 +260,7 @@ jobs:
           details = [
               line for line in lines
               if any(marker in line for marker in (
-                  "http_m2_test.go:", "broken pipe", "Error Trace:", "Error:",
+                  "M2_DIAG", "http_m2_test.go:", "broken pipe", "Error Trace:", "Error:",
                   "panic:", "fatal error:", "unexpected EOF",
               ))
           ]
@@ -258,6 +271,123 @@ jobs:
               sys.exit(2)
           PY
           parser_status=$?
+          set -e
+          if [[ "$parser_status" -ne 0 ]]; then
+            exit "$parser_status"
+          fi
+          exit "$test_status"
+
+  linux-m1-repeat:
+    name: Linux amd64 / Go 1.20 / M1 repeat / ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - profile: default x50
+            tags: ""
+            cgo: "0"
+            race: "false"
+          - profile: with_gvisor x50
+            tags: with_gvisor
+            cgo: "0"
+            race: "false"
+          - profile: default Race x50
+            tags: ""
+            cgo: "1"
+            race: "true"
+          - profile: with_gvisor Race x50
+            tags: with_gvisor
+            cgo: "1"
+            race: "true"
+    env:
+      CGO_ENABLED: ${{ matrix.cgo }}
+      CC: gcc
+      M1_TEST_TAGS: ${{ matrix.tags }}
+      M1_TEST_RACE: ${{ matrix.race }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.20.14"
+      - name: Verify Go 1.20.14 toolchain
+        run: |
+          go version
+          test "$(go version)" = "go version go1.20.14 linux/amd64"
+          test "$(go env CGO_ENABLED)" = "$CGO_ENABLED"
+      - name: Add runner-only M1 event diagnostics and repeat 50 times
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tunnel/mitm_m1_test.go")
+          source = path.read_text()
+          original = "\trequire.ErrorIs(t, err, context.Canceled)\n\tselect {\n\tcase hello := <-writes:"
+          diagnostic = "\tcalls, _ := proxy.snapshot()\n\tt.Logf(\"M1_DIAG ctx_err=%q returned_err=%q proxy_calls=%d successful_dials=%d\", ctx.Err(), err, calls, dials.Load())\n" + original
+          if source.count(original) != 1:
+              raise SystemExit("could not uniquely add runner-only M1 diagnostics")
+          path.write_text(source.replace(original, diagnostic, 1))
+          PY
+
+          args=()
+          if [[ "$M1_TEST_RACE" == "true" ]]; then
+            args+=(-race)
+          fi
+          if [[ -n "$M1_TEST_TAGS" ]]; then
+            args+=(-tags "$M1_TEST_TAGS")
+          fi
+          args+=(-run '^TestMITMDialEarlyTLSRetryCancellationDoesNotRedial$' -count=50 -v ./tunnel)
+
+          set +e
+          go test "${args[@]}" > "$RUNNER_TEMP/m1-repeat.log" 2>&1
+          test_status=$?
+          set -e
+          cat "$RUNNER_TEMP/m1-repeat.log"
+
+          set +e
+          python3 - "$RUNNER_TEMP/m1-repeat.log" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          target = "TestMITMDialEarlyTLSRetryCancellationDoesNotRedial"
+          lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+          passed = sum(line.startswith(f"--- PASS: {target} ") for line in lines)
+          failed = sum(line.startswith(f"--- FAIL: {target} ") for line in lines)
+          diagnostics = [line for line in lines if "M1_DIAG" in line]
+          calls = [int(match.group(1)) for line in diagnostics if (match := re.search(r"proxy_calls=(\d+)", line))]
+          successes = [int(match.group(1)) for line in diagnostics if (match := re.search(r"successful_dials=(\d+)", line))]
+          returned_errors = [line.split(" returned_err=", 1)[1].split(" proxy_calls=", 1)[0] for line in diagnostics if " returned_err=" in line]
+          injected_error = sum("injected EarlyConn ClientHello write failure" in error for error in returned_errors)
+          canceled_error = sum("context canceled" in error for error in returned_errors)
+          other_error = len(returned_errors) - injected_error - canceled_error
+          multiple_calls = sum(value > 1 for value in calls)
+          print(
+              "M1_REPEAT_SUMMARY: "
+              f"PASS={passed} FAIL={failed} DIAGNOSTICS={len(diagnostics)} "
+              f"RETURNED_INJECTED_WRITE_ERROR={injected_error} RETURNED_CONTEXT_CANCELED={canceled_error} "
+              f"RETURNED_OTHER_ERROR={other_error} "
+              f"PROXY_CALLS_GT1={multiple_calls} SUCCESSFUL_DIALS_GT1={sum(value > 1 for value in successes)} "
+              "EXPECTED=50"
+          )
+          details = [line for line in lines if any(marker in line for marker in (
+              "M1_DIAG", "mitm_m1_test.go:", "injected EarlyConn", "context canceled",
+              "panic:", "fatal error:",
+          ))]
+          for line in details:
+              print(f"M1_DETAIL: {line}")
+          if passed + failed != 50 or len(diagnostics) != 50:
+              print("M1_COUNT_MISMATCH: expected 50 test results and 50 diagnostics")
+              sys.exit(2)
+          if multiple_calls:
+              print("M1_UNEXPECTED_RETRY: proxy DialContext was invoked more than once after cancellation")
+              sys.exit(1)
+          PY
+          parser_status=$?
+          set -e
           if [[ "$parser_status" -ne 0 ]]; then
             exit "$parser_status"
           fi
