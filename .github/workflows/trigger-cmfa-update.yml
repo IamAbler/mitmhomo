@@ -12,8 +12,111 @@ on:
       - "v*"
       
 jobs:
+  alpha_publish_gate:
+    name: Validate Alpha publish eligibility
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/Alpha' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      publish_allowed: ${{ steps.evaluate.outputs.publish_allowed }}
+    steps:
+      - name: Validate the Alpha push commit list
+        id: evaluate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python_bin="${PYTHON_BIN:-python3}"
+          "$python_bin" - <<'PY'
+          import json
+          import os
+          import re
+
+          alpha_ref = "refs/heads/Alpha"
+          integration_commit = "fd7ae306728da551a0e37ede98f0ef878f1b9467"
+          allowed = True
+          reason = "not-alpha-push"
+
+          if os.environ.get("EVENT_NAME") == "push" and os.environ.get("EVENT_REF") == alpha_ref:
+              try:
+                  with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                      payload = json.load(event_file)
+
+                  sha_pattern = re.compile(r"[0-9a-fA-F]{40}\Z")
+                  before = payload.get("before")
+                  after = payload.get("after")
+                  event_sha = os.environ.get("EVENT_SHA", "")
+                  commits = payload.get("commits")
+
+                  if payload.get("ref") != alpha_ref:
+                      raise ValueError("ref-mismatch")
+                  if not isinstance(before, str) or not sha_pattern.fullmatch(before):
+                      raise ValueError("invalid-before-sha")
+                  if not isinstance(after, str) or not sha_pattern.fullmatch(after):
+                      raise ValueError("invalid-after-sha")
+                  if not sha_pattern.fullmatch(event_sha) or after.lower() != event_sha.lower():
+                      raise ValueError("after-sha-mismatch")
+                  forced = payload.get("forced")
+                  deleted = payload.get("deleted")
+                  if not isinstance(forced, bool) or not isinstance(deleted, bool):
+                      raise ValueError("invalid-push-flags")
+                  if forced or deleted:
+                      raise ValueError("forced-or-deleted-push")
+                  if not isinstance(commits, list) or not commits:
+                      raise ValueError("missing-or-empty-commit-list")
+                  if len(commits) >= 2048:
+                      raise ValueError("commit-list-at-payload-limit")
+
+                  commit_ids = []
+                  for commit in commits:
+                      if not isinstance(commit, dict):
+                          raise ValueError("invalid-commit-entry")
+                      commit_id = commit.get("id")
+                      if not isinstance(commit_id, str) or not sha_pattern.fullmatch(commit_id):
+                          raise ValueError("invalid-commit-id")
+                      commit_ids.append(commit_id.lower())
+                  if after.lower() not in commit_ids:
+                      raise ValueError("after-not-in-commit-list")
+
+                  if integration_commit in commit_ids:
+                      allowed = False
+                      reason = "m61-integration-commit-present"
+                  else:
+                      allowed = True
+                      reason = "complete-commit-list-without-marker"
+              except Exception:
+                  allowed = False
+                  reason = "alpha-push-payload-unverifiable"
+
+          result = "true" if allowed else "false"
+          print(f"Alpha publish gate: publish_allowed={result}; reason={reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output_file:
+              output_file.write(f"publish_allowed={result}\n")
+              output_file.write(f"reason={reason}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary_file:
+              summary_file.write(f"Alpha publish gate: `publish_allowed={result}` (`{reason}`).\n")
+          PY
+
   # Send "core-updated" to MetaCubeX/ClashMetaForAndroid to trigger update-dependencies
   trigger-CMFA-update:
+    needs: [alpha_publish_gate]
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        (
+          github.event_name != 'push' ||
+          github.ref != 'refs/heads/Alpha' ||
+          (
+            needs.alpha_publish_gate.result == 'success' &&
+            needs.alpha_publish_gate.outputs.publish_allowed == 'true'
+          )
+        )
+      }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v3
