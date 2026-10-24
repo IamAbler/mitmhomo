@@ -398,6 +398,8 @@ type m1EarlyFirstWriteErrorConn struct {
 	afterWrite func()
 }
 
+var errM1InjectedEarlyConnWrite = errors.New("injected EarlyConn ClientHello write failure")
+
 func (*m1EarlyFirstWriteErrorConn) NeedHandshake() bool { return true }
 
 func (conn *m1EarlyFirstWriteErrorConn) Write(data []byte) (int, error) {
@@ -409,7 +411,7 @@ func (conn *m1EarlyFirstWriteErrorConn) Write(data []byte) (int, error) {
 	if conn.afterWrite != nil {
 		conn.afterWrite()
 	}
-	return n, errors.New("injected EarlyConn ClientHello write failure")
+	return n, errM1InjectedEarlyConnWrite
 }
 
 type m1StalledTLSUpstream struct {
@@ -1692,14 +1694,12 @@ func TestMITMDialEarlyTLSRetryCancellationDoesNotRedial(t *testing.T) {
 	upstream := newM1StalledTLSUpstream(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	writes := make(chan []byte, 1)
-	var dials atomic.Int32
+	writes := make(chan []byte, 10)
 	proxy := &m1NativeProxy{name: "EARLY_TLS_RETRY_CANCEL_PROXY", onDial: func(ctx context.Context) (C.Conn, error) {
 		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream.listener.Addr().String())
 		if err != nil {
 			return nil, err
 		}
-		dials.Add(1)
 		return &m1EarlyFirstWriteErrorConn{
 			m1PlainNativeConn: &m1PlainNativeConn{ExtendedConn: N.NewExtendedConn(conn)},
 			writes:            writes,
@@ -1707,11 +1707,39 @@ func TestMITMDialEarlyTLSRetryCancellationDoesNotRedial(t *testing.T) {
 		}, nil
 	}}
 	metadata := configureM1DirectNativeProxy(t, proxy)
+	type handshakeResult struct {
+		contextErr error
+		err        error
+	}
+	// retry is bounded at ten attempts; keep the observer from blocking if a
+	// regression accidentally reaches more than one handshake attempt.
+	handshakeDone := make(chan handshakeResult, 10)
 	_, err := Tunnel.DialTCPWithTLSHandshake(ctx, metadata, func(ctx context.Context, conn net.Conn) (net.Conn, error) {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: "localhost"})
-		return nil, tlsConn.HandshakeContext(ctx)
+		handshakeErr := tlsConn.HandshakeContext(ctx)
+		handshakeDone <- handshakeResult{contextErr: ctx.Err(), err: handshakeErr}
+		return nil, handshakeErr
 	})
-	require.ErrorIs(t, err, context.Canceled)
+	var handshake handshakeResult
+	select {
+	case handshake = <-handshakeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the TLS handshake did not report its canceled attempt")
+	}
+	calls, _ := proxy.snapshot()
+	t.Logf("M1_DIAG parent_ctx_err=%q handshake_ctx_err=%q handshake_err=%q returned_err=%q proxy_calls=%d", ctx.Err(), handshake.contextErr, handshake.err, err, calls)
+	require.ErrorIs(t, ctx.Err(), context.Canceled, "the parent dial context must be canceled")
+	require.ErrorIs(t, handshake.contextErr, context.Canceled, "cancellation must reach the TLS handshake context")
+	require.Error(t, handshake.err, "the canceled TLS handshake must fail")
+	require.True(t,
+		errors.Is(handshake.err, context.Canceled) || errors.Is(handshake.err, errM1InjectedEarlyConnWrite),
+		"the TLS library may observe cancellation or the concurrent ClientHello write error; got: %v", handshake.err,
+	)
+	require.Error(t, err, "the canceled dial must fail")
+	require.True(t,
+		errors.Is(err, context.Canceled) || errors.Is(err, errM1InjectedEarlyConnWrite),
+		"retry cancellation may report context cancellation or the concurrent ClientHello write error; got: %v", err,
+	)
 	select {
 	case hello := <-writes:
 		require.GreaterOrEqual(t, len(hello), 5)
@@ -1721,7 +1749,7 @@ func TestMITMDialEarlyTLSRetryCancellationDoesNotRedial(t *testing.T) {
 	}
 	upstream.waitForHello(t)
 	upstream.waitForClose(t)
-	require.EqualValues(t, 1, dials.Load(), "a canceled retry must not start another native dial")
+	require.EqualValues(t, 1, calls, "a canceled retry must not invoke native DialContext again")
 	requireM1TrackerRemoved(t, metadata)
 }
 

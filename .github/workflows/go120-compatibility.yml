@@ -220,18 +220,6 @@ jobs:
       - name: Repeat focused MITM test 50 times
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("component/mitm/http_m2_test.go")
-          source = path.read_text()
-          original = "\t_, err := io.WriteString(client, request)\n\trequire.NoError(t, err)"
-          diagnostic = "\tn, err := io.WriteString(client, request)\n\tt.Logf(\"M2_DIAG request_write_bytes=%d expected_bytes=%d err=%v\", n, len(request), err)\n\trequire.NoError(t, err)"
-          if source.count(original) != 1:
-              raise SystemExit("could not uniquely add runner-only M2 write diagnostics")
-          path.write_text(source.replace(original, diagnostic, 1))
-          PY
-
           args=()
           if [[ "$MITM_TEST_RACE" == "true" ]]; then
             args+=(-race)
@@ -256,7 +244,8 @@ jobs:
           lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
           passed = sum(line.startswith(f"--- PASS: {target} ") for line in lines)
           failed = sum(line.startswith(f"--- FAIL: {target} ") for line in lines)
-          print(f"REPEAT_SUMMARY: PASS={passed} FAIL={failed} TOTAL={passed + failed} EXPECTED=50")
+          diagnostics = [line for line in lines if "M2_DIAG" in line]
+          print(f"M2_REPEAT_SUMMARY: PASS={passed} FAIL={failed} DIAGNOSTICS={len(diagnostics)} TOTAL={passed + failed} EXPECTED=50")
           details = [
               line for line in lines
               if any(marker in line for marker in (
@@ -265,8 +254,8 @@ jobs:
               ))
           ]
           for line in details:
-              print(f"FAILURE_DETAIL: {line}")
-          if passed + failed != 50:
+              print(f"M2_DETAIL: {line}")
+          if passed + failed != 50 or len(diagnostics) != 50:
               print("REPEAT_COUNT_MISMATCH: test output did not report all 50 iterations")
               sys.exit(2)
           PY
@@ -317,21 +306,9 @@ jobs:
           go version
           test "$(go version)" = "go version go1.20.14 linux/amd64"
           test "$(go env CGO_ENABLED)" = "$CGO_ENABLED"
-      - name: Add runner-only M1 event diagnostics and repeat 50 times
+      - name: Repeat focused M1 cancellation test 50 times
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("tunnel/mitm_m1_test.go")
-          source = path.read_text()
-          original = "\trequire.ErrorIs(t, err, context.Canceled)\n\tselect {\n\tcase hello := <-writes:"
-          diagnostic = "\tcalls, _ := proxy.snapshot()\n\tt.Logf(\"M1_DIAG ctx_err=%q returned_err=%q proxy_calls=%d successful_dials=%d\", ctx.Err(), err, calls, dials.Load())\n" + original
-          if source.count(original) != 1:
-              raise SystemExit("could not uniquely add runner-only M1 diagnostics")
-          path.write_text(source.replace(original, diagnostic, 1))
-          PY
-
           args=()
           if [[ "$M1_TEST_RACE" == "true" ]]; then
             args+=(-race)
@@ -359,7 +336,6 @@ jobs:
           failed = sum(line.startswith(f"--- FAIL: {target} ") for line in lines)
           diagnostics = [line for line in lines if "M1_DIAG" in line]
           calls = [int(match.group(1)) for line in diagnostics if (match := re.search(r"proxy_calls=(\d+)", line))]
-          successes = [int(match.group(1)) for line in diagnostics if (match := re.search(r"successful_dials=(\d+)", line))]
           returned_errors = [line.split(" returned_err=", 1)[1].split(" proxy_calls=", 1)[0] for line in diagnostics if " returned_err=" in line]
           injected_error = sum("injected EarlyConn ClientHello write failure" in error for error in returned_errors)
           canceled_error = sum("context canceled" in error for error in returned_errors)
@@ -370,7 +346,7 @@ jobs:
               f"PASS={passed} FAIL={failed} DIAGNOSTICS={len(diagnostics)} "
               f"RETURNED_INJECTED_WRITE_ERROR={injected_error} RETURNED_CONTEXT_CANCELED={canceled_error} "
               f"RETURNED_OTHER_ERROR={other_error} "
-              f"PROXY_CALLS_GT1={multiple_calls} SUCCESSFUL_DIALS_GT1={sum(value > 1 for value in successes)} "
+              f"PROXY_CALLS_GT1={multiple_calls} "
               "EXPECTED=50"
           )
           details = [line for line in lines if any(marker in line for marker in (
@@ -379,7 +355,7 @@ jobs:
           ))]
           for line in details:
               print(f"M1_DETAIL: {line}")
-          if passed + failed != 50 or len(diagnostics) != 50:
+          if passed + failed != 50 or len(diagnostics) != 50 or len(calls) != 50:
               print("M1_COUNT_MISMATCH: expected 50 test results and 50 diagnostics")
               sys.exit(2)
           if multiple_calls:

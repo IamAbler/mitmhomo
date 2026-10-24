@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -560,16 +561,61 @@ func TestM2LargeBodyReplacementClosesConnectionAfterResponse(t *testing.T) {
 		Name: "large-body", Match: rewrite.Match{Path: "/replace"},
 		Request: &rewrite.RequestAction{Body: &rewrite.BodyReplacement{Replace: "upstream-body"}},
 	})
-	h := newM2HTTPHarness(t, "localhost", pipeline, nil)
+	// The rewritten upstream request can proceed while the original client
+	// upload is being discarded. Hold the response so it cannot close the
+	// client socket while the test sends the required discard-limit prefix.
+	responseGate := make(chan struct{})
+	var releaseGateOnce sync.Once
+	releaseGate := func() { releaseGateOnce.Do(func() { close(responseGate) }) }
+	observedBody := make(chan string, 1)
+	h := newM2HTTPHarness(t, "localhost", pipeline, func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read replacement body", http.StatusInternalServerError)
+			return
+		}
+		observedBody <- string(body)
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-responseGate:
+		case <-timer.C:
+			http.Error(w, "response gate timed out", http.StatusGatewayTimeout)
+			return
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = io.WriteString(w, "upstream-ok")
+	})
+	t.Cleanup(releaseGate)
 	client, done := h.startTCPClient(t)
 	reader := bufio.NewReader(client)
 	original := strings.Repeat("x", 128<<10)
-	request := fmt.Sprintf("POST /replace HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n%s", len(original), original)
-	response := sendM2Request(t, client, reader, request, http.MethodPost)
+	header := fmt.Sprintf("POST /replace HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n", len(original))
+	written, err := io.WriteString(client, header)
+	require.NoError(t, err, "the request headers must reach the MITM server")
+	require.Equal(t, len(header), written)
+	const discardLimit = (64 << 10) + 1
+	bodyPrefix := original[:discardLimit+1]
+	written, err = io.WriteString(client, bodyPrefix)
+	require.NoError(t, err, "the client must send beyond the bounded discard limit before the response is released")
+	require.Equal(t, len(bodyPrefix), written)
+	var upstreamBody string
+	select {
+	case body := <-observedBody:
+		upstreamBody = body
+	case <-time.After(3 * time.Second):
+		t.Fatal("the upstream did not receive the replacement request while its response was gated")
+	}
+	t.Logf("M2_DIAG declared_body_bytes=%d sent_body_prefix_bytes=%d discard_limit_bytes=%d upstream_body=%q", len(original), len(bodyPrefix), discardLimit, upstreamBody)
+	require.Equal(t, "upstream-body", upstreamBody, "the upstream must receive the replacement body")
+	releaseGate()
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
+	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, response.StatusCode)
-	require.True(t, response.Close, "large discarded request bodies must close the client connection")
+	// net/http folds the wire Connection: close header into Response.Close.
+	require.True(t, response.Close, "the HTTP/1 response must signal Connection: close for the large discarded request body")
 	require.Equal(t, "upstream-ok", readM2ResponseBody(t, response))
-	require.Equal(t, "upstream-body", (<-h.observations).body)
 	requireM2ConnectionIsClosed(t, client, reader)
 	finishM2Dispatch(t, client, done)
 }
