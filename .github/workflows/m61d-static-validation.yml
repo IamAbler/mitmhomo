@@ -2,9 +2,6 @@ name: M6.1-D Static Link Validation
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - validation/m61-quickjs-ci
 
 permissions:
   contents: read

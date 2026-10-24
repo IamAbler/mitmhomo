@@ -1,10 +1,13 @@
-name: QuickJS M6.1 CI
+name: QuickJS CI
 
 on:
   workflow_dispatch:
   push:
     branches:
-      - validation/m61-quickjs-ci
+      - Alpha
+  pull_request:
+    branches:
+      - Alpha
 
 permissions:
   contents: read

@@ -46,9 +46,10 @@ the release string as `CONFIG_VERSION`, and the upstream `-fwrapv` behavior via
 a GCC `optimize("wrapv")` pragma in each translation unit. The bridge links
 `libm` and `pthread`, matching the upstream Makefile's core link requirements.
 Windows adds upstream's `__USE_MINGW_ANSI_STDIO` compatibility define. The
-supported Windows CGO compiler is MinGW-w64 GCC; this local environment did not
-have that compiler, so Windows compilation and DLL inspection remain
-unverified for this PoC.
+supported Windows CGO compiler is MinGW-w64 GCC. The initial local validation
+environment did not have that compiler; later Windows runner results are
+recorded under M6.1 acceptance below. Those runner checks do not replace
+clean-system distribution validation.
 
 ## License and update policy
 
@@ -68,3 +69,20 @@ focused diff and tests. Re-run the Linux and Windows CGO matrix, allocator,
 interrupt, Job Queue, and native sanitizer checks before accepting an update.
 Builds must consume the checked-in vendor tree and must never download source
 at build time.
+
+## M6.1 acceptance and distribution boundary
+
+M6.1 and the M6.1-D static-link validation both received human acceptance as
+PASS on 2026-10-24. The final QuickJS CI run is
+[#6](https://github.com/IamAbler/mitmhomo/actions/runs/40054989816); the final
+M6.1-D run is [#3](https://github.com/IamAbler/mitmhomo/actions/runs/40054989950).
+Both ran on `validation/m61-quickjs-ci` at
+`51cad112f60df61431cf00fe229958c2a9d78976`.
+
+The earlier failed QuickJS CI run remains recorded in the M6.1 remote
+validation report and in GitHub Actions history. Passing this infrastructure
+milestone does not mean the current main program uses QuickJS: the main package
+does not import `component/quickjs`, and the `quickjs` tagged main-program
+build is a build-compatibility check. Clean-system Windows validation, Linux
+arm64 validation, and final distribution of the integrated program remain
+M6.10 acceptance work.
